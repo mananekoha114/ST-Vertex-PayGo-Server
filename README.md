@@ -1,6 +1,6 @@
 # ST Vertex AI PayGo Server Plugin
 
-本项目是前端扩展 [`ST-Vertex-PayGo`](https://github.com/funnycups/Luker) 的**配套后端插件（Server Plugin）**。专门用于让 SillyTavern（酒馆）和 [Luker](https://github.com/funnycups/Luker) 能够支持 Google Vertex AI 的 **PayGo-only、Flex 以及 Priority** 计费/服务层级请求。
+本项目是前端扩展 `ST-Vertex-PayGo`的**配套后端插件（Server Plugin）**。专门用于让 SillyTavern（酒馆）和 Luker 能够支持 Google Vertex AI 的 **PayGo-only、Flex 以及 Priority** 计费/服务层级请求。
 
 > ⚠️ **注意**：
 > 1. 本插件**不是**通用的 Google API 反代，也**无法独立提供前端 UI**。必须配合前端扩展 `ST-Vertex-PayGo` 一起使用。
