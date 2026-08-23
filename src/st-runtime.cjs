@@ -19,7 +19,7 @@ async function loadStRuntime({
     }
 
     if (packageData.name !== 'sillytavern' || typeof packageData.version !== 'string' || !/^1\.18\./u.test(packageData.version)) {
-        throw new PluginError(500, 'INCOMPATIBLE_SILLYTAVERN', 'This development build requires SillyTavern 1.18.x.');
+        throw new PluginError(500, 'INCOMPATIBLE_SILLYTAVERN', 'This plugin requires SillyTavern 1.18.x.');
     }
 
     const googleModuleUrl = pathToFileURL(path.join(resolvedRoot, 'src', 'endpoints', 'google.js')).href;

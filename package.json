@@ -1,8 +1,8 @@
 {
   "name": "st-vertex-paygo-server",
-  "version": "0.1.0-dev.0",
+  "version": "0.1.0",
   "private": true,
-  "description": "Development build of the SillyTavern Vertex AI PayGo server plugin",
+  "description": "SillyTavern server plugin for Vertex AI Standard, Flex, and Priority PayGo requests",
   "license": "MPL-2.0",
   "author": {
     "name": "Mana Nekoha",

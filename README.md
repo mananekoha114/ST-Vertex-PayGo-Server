@@ -4,7 +4,7 @@
 
 它不是通用反向代理，也不能单独提供界面功能。正常使用需要同时安装独立的 `ST-Vertex-PayGo` 前端扩展。
 
-> 当前为开发版本，只兼容 SillyTavern 1.18.x。它是非官方插件，与 SillyTavern、Google 或 Google Cloud 没有隶属或认可关系。
+> 当前版本只兼容 SillyTavern 1.18.x。它是非官方插件，与 SillyTavern、Google 或 Google Cloud 没有隶属或认可关系。
 
 ## 为什么需要 Server Plugin
 
@@ -101,7 +101,7 @@ SillyTavern 会把插件路由挂载在 `/api/plugins/vertex-paygo` 下：
 
 ### 插件启动失败并报告版本不兼容
 
-确认 SillyTavern 的 `package.json` 版本属于 1.18.x，并且当前工作目录是 SillyTavern 根目录。此开发版依赖 1.18.x 的内部 Vertex AI 配置接口。
+确认 SillyTavern 的 `package.json` 版本属于 1.18.x，并且当前工作目录是 SillyTavern 根目录。此版本依赖 1.18.x 的内部 Vertex AI 配置接口。
 
 ### 前端显示协议或传输方式不匹配
 
