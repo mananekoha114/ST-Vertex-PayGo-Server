@@ -5,20 +5,43 @@ const assert = require('node:assert/strict');
 const { loadStRuntime } = require('../src/st-runtime.cjs');
 const { registerRoutes } = require('../src/routes.cjs');
 
-test('ST runtime loader validates version and the required export', async () => {
+test('ST runtime loader accepts SillyTavern 1.16+ and compatible Luker hosts', async () => {
     const helper = async () => ({});
-    const runtime = await loadStRuntime({
-        rootDir: 'C:\\fake-st',
-        readFile: async () => JSON.stringify({ name: 'sillytavern', version: '1.18.0' }),
-        importModule: async () => ({ getGoogleApiConfig: helper }),
-    });
-    assert.equal(runtime.stVersion, '1.18.0');
-    assert.equal(runtime.getGoogleApiConfig, helper);
+    const supportedHosts = [
+        { name: 'sillytavern', version: '1.16.0' },
+        { name: 'sillytavern', version: '1.18.0' },
+        { name: 'sillytavern', version: '2.0.0-beta.1' },
+        { name: 'luker', version: '2.7.0' },
+    ];
 
-    await assert.rejects(loadStRuntime({
-        readFile: async () => JSON.stringify({ name: 'sillytavern', version: '1.19.0' }),
-        importModule: async () => ({ getGoogleApiConfig: helper }),
-    }), { code: 'INCOMPATIBLE_SILLYTAVERN' });
+    for (const host of supportedHosts) {
+        const runtime = await loadStRuntime({
+            rootDir: 'C:\\fake-host',
+            readFile: async () => JSON.stringify(host),
+            importModule: async () => ({ getGoogleApiConfig: helper }),
+        });
+        assert.equal(runtime.hostName, host.name);
+        assert.equal(runtime.stVersion, host.version);
+        assert.equal(runtime.getGoogleApiConfig, helper);
+    }
+});
+
+test('ST runtime loader rejects old, unknown, malformed, or incomplete hosts', async () => {
+    const helper = async () => ({});
+    const unsupportedHosts = [
+        { name: 'sillytavern', version: '1.15.9' },
+        { name: 'sillytavern', version: 'not-a-version' },
+        { name: 'luker', version: 'not-a-version' },
+        { name: 'another-host', version: '2.7.0' },
+    ];
+
+    for (const host of unsupportedHosts) {
+        await assert.rejects(loadStRuntime({
+            readFile: async () => JSON.stringify(host),
+            importModule: async () => ({ getGoogleApiConfig: helper }),
+        }), { code: 'INCOMPATIBLE_SILLYTAVERN' });
+    }
+
     await assert.rejects(loadStRuntime({
         readFile: async () => JSON.stringify({ name: 'sillytavern', version: '1.18.0' }),
         importModule: async () => ({}),
@@ -50,5 +73,6 @@ test('route registration exposes handshake, prepare, and fail-closed sink', () =
     assert.equal(response.body.ok, true);
     assert.equal(response.body.protocolVersion, 1);
     assert.equal(response.body.transport, 'loopback-http');
+    assert.equal(response.body.sillyTavern.compatibleRange, '>=1.16.0');
     assert.equal(Object.hasOwn(response.body, 'port'), false);
 });
