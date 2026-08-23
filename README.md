@@ -1,134 +1,139 @@
-__这个文档是纯GPT编写的，阅读时请注意__
-
 # ST Vertex AI PayGo Server Plugin
 
-`ST-Vertex-PayGo` 前端扩展的配套 Server Plugin，为 SillyTavern 和 [Luker](https://github.com/funnycups/Luker) 中的 Google Vertex AI Standard PayGo-only、Flex 和 Priority 请求提供受限制的服务端传输层。
+本项目是前端扩展 [`ST-Vertex-PayGo`](https://github.com/funnycups/Luker) 的**配套后端插件（Server Plugin）**。专门用于让 SillyTavern（酒馆）和 [Luker](https://github.com/funnycups/Luker) 能够支持 Google Vertex AI 的 **PayGo-only、Flex 以及 Priority** 计费/服务层级请求。
 
-它不是通用反向代理，也不能单独提供界面功能。正常使用需要同时安装独立的 `ST-Vertex-PayGo` 前端扩展。
+> ⚠️ **注意**：
+> 1. 本插件**不是**通用的 Google API 反代，也**无法独立提供前端 UI**。必须配合前端扩展 `ST-Vertex-PayGo` 一起使用。
+> 2. 当前已验证兼容 SillyTavern `1.16.0` / `1.17.0` / `1.18.0` 以及 Luker `2.7.0` (release 分支)。
+> 3. 本项目为第三方非官方插件，与 SillyTavern、Luker 或 Google Cloud 无任何官方关联。
 
-> 当前版本已验证兼容 SillyTavern 1.16.0、1.17.0、1.18.0，以及 Luker 2.7.0 的 release 分支。它是非官方插件，与 SillyTavern、Luker、Google 或 Google Cloud 没有隶属或认可关系。
+---
 
-## 为什么需要 Server Plugin
+## 为什么需要这个后端插件？
 
-这些兼容宿主的原生 Vertex AI 请求没有提供 PayGo 服务层级选项。前端扩展负责选择和保存层级，Server Plugin 则在宿主服务端完成以下工作：
+SillyTavern 和 Luker 原生的 Vertex AI 请求逻辑并没有暴露 Google 的 PayGo 服务层级参数。为了在不破坏宿主原生认证的前提下支持这些层级，我们需要前后端配合：
 
-- 复用当前用户已经保存在宿主中的 Vertex AI 认证配置。
-- 根据 Standard PayGo-only、Flex 或 Priority 注入对应的 Google 请求头。
-- 为单次请求签发短期票据和随机凭据。
-- 通过只监听 `127.0.0.1` 的临时 HTTP 端口接收宿主服务端转发的请求。
-- 严格验证 Vertex AI 主机、模型、操作、查询参数和认证请求头后再连接 Google。
+- **前端扩展**：负责提供 UI，供用户选择并保存需要的服务层级（PayGo-only / Flex / Priority）。
+- **后端插件（本项目）**：
+  - 直接复用你在酒馆/Luker 中已经配置好的 Vertex AI 认证信息（无需重复填 Key）。
+  - 根据选定层级，自动为请求注入 Google 专属的 PayGo 标头。
+  - 通过本地 `127.0.0.1` 临时端口实现安全的中继转发与参数校验。
+
+---
 
 ## 环境要求
 
-- SillyTavern 1.16.0 或更高版本，或者 Luker 2.7.0 release 分支。
-- Node.js 20 或更高版本。
-- 已配置可用 Vertex AI Express 或完整服务账号认证的宿主用户。
-- 配套的 `ST-Vertex-PayGo` 前端扩展。
+- **宿主程序**：SillyTavern >= 1.16.0 或 Luker >= 2.7.0（release 分支）
+- **运行环境**：Node.js >= 20
+- **前置配置**：宿主中已配置好可用的 Vertex AI（Express 模式或 Service Account 服务账号均可）
+- **配套前端**：已安装 `ST-Vertex-PayGo` 前端扩展
 
-插件启动时会读取宿主根目录的 `package.json` 和 `src/endpoints/google.js`。SillyTavern 版本低于 1.16.0、宿主不是 SillyTavern 或 Luker、版本号无效，或者缺少所需的 Vertex AI 配置接口时，插件都会拒绝启动。
+> 插件启动时会自动校验宿主的 `package.json` 和 `src/endpoints/google.js`。若版本过低、非支持的宿主或缺少必要的 Vertex 接口，插件会自动拒绝启动以防报错。
 
-## 安装
+---
 
-停止 SillyTavern 或 Luker，将本仓库放入宿主根目录下的：
+## 安装说明
+
+1. 彻底关闭 SillyTavern 或 Luker 进程。
+2. 将**本项目（后端插件）**放入宿主目录的 `plugins` 文件夹下：
+   ```text
+   <宿主根目录>/plugins/ST-Vertex-PayGo-Server/
+   ```
+3. 将**前端扩展**放入对应的扩展目录下：
+   ```text
+   <宿主根目录>/public/scripts/extensions/third-party/ST-Vertex-PayGo/
+   ```
+4. 重新启动宿主程序（本项目**无额外 npm 依赖**，放入即用）。
+5. 启动后，前端扩展设置面板中显示 `Server Plugin 已就绪` 即代表安装成功。
+
+---
+
+## 工作原理
 
 ```text
-<宿主根目录>/plugins/ST-Vertex-PayGo-Server/
+[前端扩展] --(1. Prepare 预检请求)--> [本后端插件] (生成一次性 Ticket + 临时 Token)
+                                         |
+[酒馆/Luker 后端] <--(2. 发送请求到 127.0.0.1 本地回环)--+
+       |
+  (3. 校验 Ticket/Token + 注入 PayGo Header)
+       |
+       v
+[Google Vertex AI 官方接口]
 ```
 
-同时将前端仓库放入：
+1. **预检**：前端在发起生成前，先请求后端的 `/api/plugins/vertex-paygo/prepare` 接口。
+2. **鉴权与签发**：插件校验模型、区域与层级后，从宿主获取当前用户的 Vertex 认证头，生成一张**5分钟有效、阅后即焚**的一次性票据（Ticket）和随机 Token，并返回仅限本地监听的代理地址（`127.0.0.1:xxxx`）。
+3. **中继转发**：宿主把生成请求发往该本地回环地址，插件校验 Token 和请求参数无误后核销票据，追加对应的 PayGo 标头并转发给 Google。
 
-```text
-<宿主根目录>/public/scripts/extensions/third-party/ST-Vertex-PayGo/
-```
+*(注：浏览器不会直接连接回环端口，即使酒馆部署在远程 VPS 上，也是由 VPS 上的服务端进程内部访问 `127.0.0.1`，保证安全性。)*
 
-本项目没有需要单独安装的运行时 npm 依赖。重新启动宿主后，前端扩展应显示 Server Plugin 已就绪。
+---
 
-## 请求流程
+## 请求头注入规则
 
-1. 前端扩展在生成前向 `/api/plugins/vertex-paygo/prepare` 发送经过宿主登录和 CSRF 保护的控制请求。
-2. Server Plugin 验证协议、来源、Gemini 模型、区域、认证模式和层级组合。
-3. 插件调用宿主自身的 Vertex AI 配置接口，取得当前用户对应的 Google 目标地址和认证请求头。
-4. 插件生成五分钟有效的一次性票据与随机代理凭据，并返回仅绑定到 `127.0.0.1` 的代理 URL。
-5. 宿主服务端把实际生成请求发送到这个本机回送地址，并通过 Bearer 凭据证明它持有该票据。
-6. 插件以原子方式验证凭据和完整请求后缀并消费票据，再次验证 Google 目标和请求头，最后将请求转发给 Vertex AI。
+| 选中的服务层级 | 自动追加的 Request Header |
+| :--- | :--- |
+| **开启 PayGo-only** | `X-Vertex-AI-LLM-Request-Type: shared` |
+| **Flex** | `X-Vertex-AI-LLM-Shared-Request-Type: flex`<br>`X-Server-Timeout: 1800` |
+| **Priority** | `X-Vertex-AI-LLM-Shared-Request-Type: priority` |
 
-浏览器不会直接连接本机回送端口。即使宿主部署在远程服务器上，访问 `127.0.0.1` 的仍是宿主服务端进程。
+- `PayGo-only` 可与 `Flex` 或 `Priority` 组合使用（会同时注入两组请求头）。
+- 若为 **Standard 且未勾选 PayGo-only**，属于原生默认请求，插件会直接拒绝签发代理票据，由宿主走官方原生通道。
 
-## 服务层级请求头
+---
 
-| 设置 | 添加的请求头 |
-| --- | --- |
-| PayGo-only 开启 | `X-Vertex-AI-LLM-Request-Type: shared` |
-| Flex | `X-Vertex-AI-LLM-Shared-Request-Type: flex`、`X-Server-Timeout: 1800` |
-| Priority | `X-Vertex-AI-LLM-Shared-Request-Type: priority` |
+## 安全机制
 
-PayGo-only 可以与 Flex 或 Priority 组合，因此对应请求可能同时包含两类 PayGo 请求头。
+为了保证你的账号和网络安全，本插件设计了严格的安全限制：
+- **仅本地监听**：代理服务仅绑定 `127.0.0.1` 随机端口，绝不对局域网或公网开放。
+- **一次性票据**：每张票据 5 分钟有效，成功使用一次即作废，且带有随机 Bearer Token 保护。
+- **纯内存存储**：票据、Token 及鉴权信息均保存在内存中，重启即焚，绝不落盘。
+- **严格白名单**：仅允许 POST JSON 请求（上限 500 MiB），目标域名强匹配 Google 官方 Vertex AI 地址，不跟随任何上游 30x 重定向。
+- **Header 过滤**：转发时仅透传 `Content-Type`、`Authorization`、`X-Goog-Api-Key` 及插件注入的 PayGo 标头，剥离其余无关字段。
 
-Standard 且 PayGo-only 关闭时必须使用宿主原生 Vertex AI 请求；Server Plugin 会拒绝为这种组合创建代理票据。
+---
 
-## 控制接口
+## 不支持的使用场景
 
-宿主会把插件路由挂载在 `/api/plugins/vertex-paygo` 下：
+- ❌ 非 Gemini 系列的 Vertex AI 模型。
+- ❌ 非 Google Vertex AI 官方来源（如第三方转接 API）。
+- ❌ 将 Flex / Priority 与区域端点（Regional Endpoints）混用。
+- ❌ 把现有的第三方反代 URL 传入本插件。
+- ❌ 将本插件当做长期、多人共享的公开 Google API 代理使用。
 
-- `GET /health`：返回插件版本、协议版本、传输类型和宿主兼容信息。
-- `POST /prepare`：验证单次 Vertex AI 请求并签发代理票据。
-- `/rejected`：前端 prepare 失败时使用的兜底拦截端点，始终拒绝请求。
+---
 
-当前通信协议版本为 `1`，传输类型为 `loopback-http`。这些接口主要供配套前端扩展调用；第三方集成必须完整实现协议握手、出错即拦截和代理 URL 校验，不能把 prepare 失败当作回退到原生请求的条件。
+## 常见问题 (FAQ)
 
-## 安全边界
+### Q: 启动时报错提示版本不兼容？
+**A**: 
+1. 检查运行目录是否为 SillyTavern 或 Luker 的根目录。
+2. 确认宿主版本是否达到要求（SillyTavern ≥ 1.16.0 / Luker ≥ 2.7.0）。
+3. 检查宿主目录下的 `src/endpoints/google.js` 是否存在且未被第三方魔改破坏。
 
-- 本机代理只监听 `127.0.0.1` 的随机端口，不监听局域网或公网地址。
-- 每张票据默认五分钟过期、只能成功消费一次，并由独立的随机 Bearer 凭据保护。
-- 最多保留 256 张待使用票据；容量用尽时返回错误，不会静默逐出其他票据。
-- 只接受 JSON `POST`，默认请求体上限为 500 MiB。
-- 票据绑定模型、流式模式、Vertex 操作、区域、目标 URL 和认证请求头。
-- 目标仅允许精确匹配的 Vertex AI HTTPS 主机与路径；不跟随上游重定向。
-- 只允许 `Content-Type`、`Authorization` 和 `X-Goog-Api-Key` 进入 Google 请求，并由插件单独加入 PayGo 请求头。
-- Flex 请求添加 1800 秒服务端超时提示；插件自身的上游连接超时为 31 分钟。
-- 代理票据、凭据和解析后的 Google 认证信息只保存在内存中，插件退出时会清空。
+### Q: 前端提示“协议或传输方式不匹配”？
+**A**: 请确保前端扩展与本后端插件均更新到了最新版本（当前两端协议版本号需一致为 `1`，传输模式为 `loopback-http`）。
 
-这些限制用于缩小 Server Plugin 的权限范围，但不能替代宿主本身的账号、网络和文件系统安全配置。
+### Q: Flex 模式下长时间没有响应？
+**A**: Flex（弹性调度）本身在 Google 端就允许排队与延迟执行。插件针对 Flex 设置了约 31 分钟的连接超时时间，请耐心等待 Google 调度返回。
 
-## 不支持的用法
+### Q: Priority 模式下为何在后台看调度状态不一定是 Priority？
+**A**: 插件会如实发送 `X-Vertex-AI-LLM-Shared-Request-Type: priority` 标头，但最终请求是否被判定为高优先级，取决于你的 GCP 项目配额、当前模型可用容量及 Google 端的排队策略。
 
-- 非 Gemini Vertex AI 模型。
-- 非 Vertex AI API 来源。
-- Flex 或 Priority 与区域端点组合。
-- 把现有自定义反向代理传入 prepare。
-- 将本机回送代理用作长期、多人共享或通用 Google API 代理。
-- 在 SillyTavern 1.16.0 之前的版本、未经验证的宿主或缺少所需 Vertex AI 接口的分支上绕过兼容性检查运行。
+---
 
-## 常见问题
+## 本地测试
 
-### 插件启动失败并报告版本不兼容
+如果你需要对本插件进行二次开发，可运行内置测试集：
 
-确认当前工作目录是 SillyTavern 或 Luker 根目录，并且 `package.json` 中的名称和版本符合上方环境要求。插件还需要宿主的 `src/endpoints/google.js` 导出兼容的 Vertex AI 配置接口；只有版本号符合要求但缺少该接口时，插件仍会拒绝启动。
-
-### 前端显示协议或传输方式不匹配
-
-确保前端扩展和 Server Plugin 来自相互兼容的版本。当前两端都要求协议 `1` 和 `loopback-http`。
-
-### Flex 长时间没有返回
-
-Flex 本身允许延迟执行。插件不会在宿主默认的短超时内提前中止，但上游请求仍会在约 31 分钟后超时。
-
-### Priority 请求没有显示为 `ON_DEMAND_PRIORITY`
-
-插件会发送 `X-Vertex-AI-LLM-Shared-Request-Type: priority`，但实际调度类型由 Vertex AI 根据模型、项目资格、配额和可用容量决定。
-
-## 开发与测试
-
-运行测试：
-
-```powershell
+```bash
 node --test
 ```
 
-测试覆盖协议和目标校验、请求头策略、SillyTavern/Luker 运行时适配、prepare、票据生命周期，以及本机回送代理的成功与失败路径。
+---
 
-## 许可与署名
+## 开源协议
 
-Copyright © 2026 [Mana Nekoha](https://github.com/mananekoha114)（@mananekoha114）
+Copyright © 2026 [Mana Nekoha](https://github.com/mananekoha114) (@mananekoha114)
 
-本项目采用 [Mozilla Public License 2.0](LICENSE)（SPDX：`MPL-2.0`）许可。修改并分发本项目文件时，请遵守 MPL 2.0 的文件级开放源代码要求。
+本项目采用 **[Mozilla Public License 2.0 (MPL-2.0)](LICENSE)** 协议开源。在修改并分发本项目代码时，请遵守 MPL-2.0 相关的开源与署名要求。
