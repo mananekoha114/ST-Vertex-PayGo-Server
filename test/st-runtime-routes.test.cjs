@@ -73,6 +73,7 @@ test('route registration exposes handshake, prepare, and fail-closed sink', () =
     assert.equal(response.body.ok, true);
     assert.equal(response.body.protocolVersion, 1);
     assert.equal(response.body.transport, 'loopback-http');
+    assert.equal(response.body.pluginVersion, '0.2.0');
     assert.equal(response.body.sillyTavern.compatibleRange, '>=1.16.0');
     assert.equal(Object.hasOwn(response.body, 'port'), false);
 });
