@@ -1,3 +1,5 @@
+__这个文档是纯GPT编写的，阅读时请注意__
+
 # ST Vertex AI PayGo Server Plugin
 
 `ST-Vertex-PayGo` 前端扩展的配套 SillyTavern Server Plugin，为 Google Vertex AI Standard PayGo-only、Flex 和 Priority 请求提供受限制的服务端传输层。
