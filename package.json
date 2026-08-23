@@ -3,6 +3,11 @@
   "version": "0.1.0-dev.0",
   "private": true,
   "description": "Development build of the SillyTavern Vertex AI PayGo server plugin",
+  "license": "MPL-2.0",
+  "author": {
+    "name": "Mana Nekoha",
+    "url": "https://github.com/mananekoha114"
+  },
   "type": "commonjs",
   "main": "index.cjs",
   "engines": {
