@@ -58,18 +58,22 @@ test('ST runtime loader rejects old, unknown, malformed, or incomplete hosts', a
 
 test('route registration exposes handshake, prepare, and fail-closed sink', () => {
     const routes = { get: [], post: [], use: [] };
+    const logEvents = [];
     const router = {
         get(path, handler) { routes.get.push({ path, handler }); },
         post(path, handler) { routes.post.push({ path, handler }); },
         use(path, handler) { routes.use.push({ path, handler }); },
     };
     registerRoutes(router, {
-        stRuntime: { stVersion: '1.18.0' },
+        stRuntime: { hostName: 'sillytavern', stVersion: '1.18.0' },
         ticketStore: {},
         loopbackTransport: {},
+        logStore: {
+            server(level, event, context) { logEvents.push({ level, event, context }); },
+        },
     });
-    assert.deepEqual(routes.get.map(route => route.path), ['/health']);
-    assert.deepEqual(routes.post.map(route => route.path), ['/prepare']);
+    assert.deepEqual(routes.get.map(route => route.path), ['/health', '/logs']);
+    assert.deepEqual(routes.post.map(route => route.path), ['/logs/client', '/prepare']);
     assert.deepEqual(routes.use.map(route => route.path), ['/rejected']);
 
     const response = {
@@ -77,11 +81,23 @@ test('route registration exposes handshake, prepare, and fail-closed sink', () =
         set() { return this; },
         json(value) { this.body = value; return this; },
     };
-    routes.get[0].handler({}, response);
+    routes.get[0].handler({ user: { profile: { admin: true } } }, response);
     assert.equal(response.body.ok, true);
     assert.equal(response.body.protocolVersion, 1);
     assert.equal(response.body.transport, 'loopback-http');
-    assert.equal(response.body.pluginVersion, '0.2.0');
+    assert.equal(response.body.pluginVersion, '0.3.0');
     assert.equal(response.body.sillyTavern.compatibleRange, '>=1.16.0');
+    assert.deepEqual(response.body.capabilities, { logs: true, clientLogging: true });
     assert.equal(Object.hasOwn(response.body, 'port'), false);
+    assert.deepEqual(logEvents, []);
+
+    const nonAdminResponse = {
+        body: undefined,
+        set() { return this; },
+        json(value) { this.body = value; return this; },
+    };
+    routes.get[0].handler({ user: { profile: { admin: false } } }, nonAdminResponse);
+    assert.equal(nonAdminResponse.body.capabilities.logs, false);
+    assert.equal(nonAdminResponse.body.capabilities.clientLogging, false);
+    assert.deepEqual(logEvents, []);
 });

@@ -38,8 +38,15 @@ function makeBody(overrides = {}) {
     };
 }
 
+function captureLog(records) {
+    return {
+        server(level, event, context) { records.push({ level, event, context }); },
+    };
+}
+
 test('prepare synthesizes ST auth request and issues an opaque loopback ticket', async () => {
     const calls = [];
+    const logs = [];
     const ticketStore = new TicketStore();
     const stRuntime = {
         async getGoogleApiConfig(request, model, endpoint) {
@@ -55,6 +62,7 @@ test('prepare synthesizes ST auth request and issues an opaque loopback ticket',
             stRuntime,
             ticketStore,
             loopbackTransport: { baseUrl: 'http://127.0.0.1:54321' },
+            logStore: captureLog(logs),
         });
         const response = makeResponse();
         await handler({ body: makeBody(), user: { directories: { root: 'private' } } }, response);
@@ -77,6 +85,9 @@ test('prepare synthesizes ST auth request and issues an opaque loopback ticket',
         assert.equal(ticketData.headers['X-Vertex-AI-LLM-Shared-Request-Type'], 'flex');
         assert.equal(ticketData.headers['X-Server-Timeout'], '1800');
         assert.equal(response.body.targetUrl, undefined);
+        assert.deepEqual(logs.map(record => record.event), ['prepare_started', 'prepare_succeeded']);
+        assert.equal(logs.at(-1).context.model, 'gemini-2.5-pro');
+        assert.doesNotMatch(JSON.stringify(logs), /private-google-token|proxySecret|ticket/u);
     } finally {
         ticketStore.close();
     }
@@ -84,17 +95,22 @@ test('prepare synthesizes ST auth request and issues an opaque loopback ticket',
 
 test('prepare converts authentication failures to a stable non-sensitive error', async () => {
     const ticketStore = new TicketStore();
+    const logs = [];
     try {
         const handler = createPrepareHandler({
             stRuntime: { async getGoogleApiConfig() { throw new Error('private key contents'); } },
             ticketStore,
             loopbackTransport: { baseUrl: 'http://127.0.0.1:1' },
+            logStore: captureLog(logs),
         });
         const response = makeResponse();
         await handler({ body: makeBody(), user: { directories: {} } }, response);
         assert.equal(response.statusCode, 400);
         assert.equal(response.body.code, 'VERTEX_AUTH_CONFIGURATION_FAILED');
         assert.doesNotMatch(response.body.message, /private key/u);
+        assert.equal(logs.at(-1).event, 'prepare_failed');
+        assert.equal(logs.at(-1).context.errorCode, 'VERTEX_AUTH_CONFIGURATION_FAILED');
+        assert.doesNotMatch(JSON.stringify(logs), /private key/u);
     } finally {
         ticketStore.close();
     }

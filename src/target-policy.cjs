@@ -16,7 +16,7 @@ function escapeRegularExpression(value) {
     return value.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
 }
 
-function parseAndValidateGoogleTarget(rawUrl, { model, region, stream }, prepared) {
+function parseAndValidateGoogleTarget(rawUrl, { model, region, stream, source = 'vertexai' }, prepared) {
     let target;
     try {
         target = new URL(rawUrl);
@@ -24,11 +24,14 @@ function parseAndValidateGoogleTarget(rawUrl, { model, region, stream }, prepare
         throw new PluginError(500, 'UNSAFE_GOOGLE_TARGET', 'SillyTavern returned an invalid Google endpoint.');
     }
 
-    const expectedHost = region === 'global'
+    const aiStudio = source === 'makersuite';
+    const expectedHost = aiStudio ? 'generativelanguage.googleapis.com' : region === 'global'
         ? 'aiplatform.googleapis.com'
         : `${region}-aiplatform.googleapis.com`;
     const endpoint = stream ? 'streamGenerateContent' : 'generateContent';
-    const expectedPath = new RegExp(
+    const expectedPath = aiStudio ? new RegExp(
+        `^/v1(?:beta|alpha)?/models/${escapeRegularExpression(model)}:${endpoint}$`, 'u',
+    ) : new RegExp(
         `^/v1/(?:projects/[a-z0-9][a-z0-9-]{0,62}/locations/${escapeRegularExpression(region)}/)?publishers/google/models/${escapeRegularExpression(model)}:${endpoint}$`,
         'u',
     );
@@ -42,7 +45,7 @@ function parseAndValidateGoogleTarget(rawUrl, { model, region, stream }, prepare
         || target.hash !== ''
         || !expectedPath.test(target.pathname)
     ) {
-        throw new PluginError(500, 'UNSAFE_GOOGLE_TARGET', 'SillyTavern returned a Google endpoint outside the approved Vertex AI target.');
+        throw new PluginError(500, 'UNSAFE_GOOGLE_TARGET', 'SillyTavern returned a Google endpoint outside the approved provider target.');
     }
 
     const queryEntries = [...target.searchParams.entries()];

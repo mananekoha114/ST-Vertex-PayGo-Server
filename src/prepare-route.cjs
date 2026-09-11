@@ -10,21 +10,42 @@
 
 const { buildPayGoHeaders } = require('./header-policy.cjs');
 const { sendExpressError, PluginError } = require('./errors.cjs');
+const { describeError } = require('./log-store.cjs');
 const { PLUGIN_ID, PROTOCOL_VERSION, validatePreparePayload } = require('./protocol.cjs');
 const { prepareGoogleHeaders, prepareGoogleTarget } = require('./target-policy.cjs');
 
-function createPrepareHandler({ stRuntime, ticketStore, loopbackTransport }) {
+function prepareLogContext(config, startedAt, additional = undefined) {
+    return {
+        ...(config ? {
+            model: config.model,
+            provider: config.source,
+            tier: config.tier,
+            region: config.region,
+            stream: config.stream,
+            paygoOnly: config.paygoOnly,
+        } : {}),
+        durationMs: Date.now() - startedAt,
+        ...additional,
+    };
+}
+
+function createPrepareHandler({ stRuntime, ticketStore, loopbackTransport, logStore }) {
     return async function prepareHandler(request, response) {
+        const startedAt = Date.now();
+        let config;
+        logStore?.server('info', 'prepare_started');
         try {
-            const config = validatePreparePayload(request.body);
+            config = validatePreparePayload(request.body);
             if (!request.user || !request.user.directories) {
                 throw new PluginError(401, 'AUTHENTICATED_USER_REQUIRED', 'An authenticated SillyTavern user is required.');
             }
 
             const syntheticBody = {
-                api: 'vertexai',
-                vertexai_auth_mode: config.authMode,
-                vertexai_region: config.region,
+                api: config.source,
+                ...(config.source === 'vertexai' ? {
+                    vertexai_auth_mode: config.authMode,
+                    vertexai_region: config.region,
+                } : {}),
             };
             if (config.expressProjectId) syntheticBody.vertexai_express_project_id = config.expressProjectId;
             if (config.secretId) syntheticBody.secret_id = config.secretId;
@@ -43,8 +64,8 @@ function createPrepareHandler({ stRuntime, ticketStore, loopbackTransport }) {
             } catch (error) {
                 throw new PluginError(
                     400,
-                    'VERTEX_AUTH_CONFIGURATION_FAILED',
-                    'Vertex AI authentication is unavailable for this configuration.',
+                    config.source === 'vertexai' ? 'VERTEX_AUTH_CONFIGURATION_FAILED' : 'GOOGLE_AUTH_CONFIGURATION_FAILED',
+                    'Google authentication is unavailable for this configuration.',
                     { cause: error },
                 );
             }
@@ -52,11 +73,13 @@ function createPrepareHandler({ stRuntime, ticketStore, loopbackTransport }) {
             const targetUrl = prepareGoogleTarget(googleConfig.url, config);
             const headers = prepareGoogleHeaders(googleConfig.headers, buildPayGoHeaders(config));
             if (request.aborted || response.destroyed) {
+                logStore?.server('warn', 'prepare_client_disconnected', prepareLogContext(config, startedAt));
                 return undefined;
             }
             const issued = ticketStore.create({
                 targetUrl,
                 headers,
+                source: config.source,
                 model: config.model,
                 stream: config.stream,
                 endpoint,
@@ -66,6 +89,7 @@ function createPrepareHandler({ stRuntime, ticketStore, loopbackTransport }) {
             const proxyUrl = `${loopbackTransport.baseUrl}/proxy/${issued.ticket}`;
 
             response.set?.('Cache-Control', 'no-store');
+            logStore?.server('info', 'prepare_succeeded', prepareLogContext(config, startedAt));
             return response.json({
                 ok: true,
                 protocolVersion: PROTOCOL_VERSION,
@@ -77,6 +101,7 @@ function createPrepareHandler({ stRuntime, ticketStore, loopbackTransport }) {
                 expiresAt: issued.expiresAt,
             });
         } catch (error) {
+            logStore?.server('error', 'prepare_failed', prepareLogContext(config, startedAt, describeError(error)));
             return sendExpressError(response, error);
         }
     };

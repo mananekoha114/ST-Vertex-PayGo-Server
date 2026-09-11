@@ -14,16 +14,18 @@ const REQUEST_TYPE_HEADER = 'X-Vertex-AI-LLM-Request-Type';
 const SHARED_REQUEST_TYPE_HEADER = 'X-Vertex-AI-LLM-Shared-Request-Type';
 const SERVER_TIMEOUT_HEADER = 'X-Server-Timeout';
 
-function buildPayGoHeaders({ tier, paygoOnly }) {
-    if (!['standard', 'flex', 'priority'].includes(tier) || typeof paygoOnly !== 'boolean') {
+function buildPayGoHeaders({ tier, paygoOnly, source = 'vertexai' }) {
+    if (!['standard', 'flex', 'priority'].includes(tier) || typeof paygoOnly !== 'boolean'
+        || !['vertexai', 'makersuite'].includes(source)
+        || (source === 'makersuite' && (tier !== 'flex' || paygoOnly))) {
         throw new PluginError(500, 'INVALID_HEADER_POLICY', 'The PayGo header policy received invalid state.');
     }
 
     const headers = {};
-    if (paygoOnly) {
+    if (source === 'vertexai' && paygoOnly) {
         headers[REQUEST_TYPE_HEADER] = 'shared';
     }
-    if (tier === 'flex' || tier === 'priority') {
+    if (source === 'vertexai' && (tier === 'flex' || tier === 'priority')) {
         headers[SHARED_REQUEST_TYPE_HEADER] = tier;
     }
     if (tier === 'flex') {

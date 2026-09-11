@@ -34,6 +34,7 @@ function validBody(overrides = {}) {
 test('prepare protocol accepts a canonical Vertex Gemini request', () => {
     assert.deepEqual(validatePreparePayload(validBody()), {
         protocolVersion: 1,
+        source: 'vertexai',
         model: 'gemini-2.5-pro',
         region: 'global',
         authMode: 'full',

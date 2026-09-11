@@ -50,10 +50,21 @@ function ticketPayload(overrides = {}) {
     };
 }
 
+function captureLog(records) {
+    return {
+        server(level, event, context) { records.push({ level, event, context }); },
+    };
+}
+
 test('loopback proxy validates, consumes, forwards, and streams the raw response', async () => {
     const calls = [];
+    const logs = [];
     const store = new TicketStore();
-    const transport = createLoopbackTransport({ ticketStore: store, upstreamRequest: createFakeUpstream(calls) });
+    const transport = createLoopbackTransport({
+        ticketStore: store,
+        logStore: captureLog(logs),
+        upstreamRequest: createFakeUpstream(calls),
+    });
     await transport.start();
     try {
         const issued = store.create(ticketPayload());
@@ -72,6 +83,10 @@ test('loopback proxy validates, consumes, forwards, and streams the raw response
         assert.equal(calls.length, 1);
         assert.equal(calls[0].body, '{"contents":[]}');
         assert.equal(calls[0].options.headers.Authorization, 'Bearer google-token');
+        assert.ok(logs.some(record => record.event === 'loopback_started'));
+        assert.ok(logs.some(record => record.event === 'proxy_forward_started'));
+        assert.ok(logs.some(record => record.event === 'proxy_completed' && record.context.statusCode === 202));
+        assert.doesNotMatch(JSON.stringify(logs), /google-token|proxySecret|ticket/u);
 
         const replay = await fetch(`${transport.baseUrl}/proxy/${issued.ticket}/v1/publishers/google/models/gemini-2.5-pro:streamGenerateContent?alt=sse`, {
             method: 'POST',
@@ -178,9 +193,11 @@ test('loopback proxy enforces its independent request-body limit', async () => {
 
 test('loopback proxy applies a bounded upstream timeout longer than Flex server timeout', async () => {
     let configuredTimeout;
+    const logs = [];
     const store = new TicketStore();
     const transport = createLoopbackTransport({
         ticketStore: store,
+        logStore: captureLog(logs),
         upstreamTimeoutMs: 31 * 60_000,
         upstreamRequest() {
             const request = new PassThrough();
@@ -203,6 +220,8 @@ test('loopback proxy applies a bounded upstream timeout longer than Flex server 
         assert.equal(configuredTimeout, 31 * 60_000);
         assert.equal(response.status, 504);
         assert.equal((await response.json()).code, 'VERTEX_UPSTREAM_TIMEOUT');
+        assert.ok(logs.some(record => record.event === 'proxy_failed'
+            && record.context.errorCode === 'VERTEX_UPSTREAM_TIMEOUT'));
     } finally {
         store.close();
         await transport.close();

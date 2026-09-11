@@ -14,11 +14,13 @@ const {
     PLUGIN_VERSION,
     PROTOCOL_VERSION,
 } = require('./protocol.cjs');
+const { createClientLogHandler, createReadLogsHandler } = require('./log-routes.cjs');
 const { createPrepareHandler } = require('./prepare-route.cjs');
 
 function registerRoutes(router, dependencies) {
-    router.get('/health', (_request, response) => {
+    router.get('/health', (request, response) => {
         response.set?.('Cache-Control', 'no-store');
+        const isAdmin = request.user?.profile?.admin === true;
         response.json({
             ok: true,
             status: 'ok',
@@ -30,8 +32,14 @@ function registerRoutes(router, dependencies) {
                 version: dependencies.stRuntime.stVersion,
                 compatibleRange: COMPATIBLE_ST_RANGE,
             },
+            capabilities: {
+                logs: isAdmin,
+                clientLogging: isAdmin,
+            },
         });
     });
+    router.get('/logs', createReadLogsHandler(dependencies));
+    router.post('/logs/client', createClientLogHandler(dependencies));
     router.post('/prepare', createPrepareHandler(dependencies));
     router.use('/rejected', (_request, response) => response.status(503).json({
         error: true,
