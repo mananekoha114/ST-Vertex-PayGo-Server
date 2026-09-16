@@ -20,8 +20,10 @@ const MAX_CLIENT_EVENT_BYTES = 4096;
 const CLIENT_LOG_MEDIA_TYPE = 'application/vnd.st-vertex-paygo.client-log+json';
 const MAX_DETAIL_KEYS = 20;
 const MAX_DETAIL_STRING_LENGTH = 256;
+const DEFAULT_MAX_LOW_PRIORITY_BYTES = 2 * 1024 * 1024;
 const LEVELS = new Set(['info', 'warn', 'error']);
 const SOURCES = new Set(['server', 'client']);
+const PRIORITIES = new Set(['low', 'normal']);
 const EVENT_PATTERN = /^[A-Za-z][A-Za-z0-9_.:-]{0,63}$/u;
 const DETAIL_KEY_PATTERN = /^[A-Za-z][A-Za-z0-9]{0,31}$/u;
 const ERROR_CODE_PATTERN = /^[A-Za-z][A-Za-z0-9_.:-]{0,127}$/u;
@@ -139,6 +141,7 @@ class LogStore {
         fileName = LOG_FILE_NAME,
         maxFileBytes = DEFAULT_MAX_FILE_BYTES,
         maxClientBytes,
+        maxLowPriorityBytes,
         now = () => new Date(),
         fsModule = fs,
     } = {}) {
@@ -155,16 +158,26 @@ class LogStore {
             || resolvedMaxClientBytes >= maxFileBytes) {
             throw new TypeError('Invalid client log size limit.');
         }
+        const resolvedMaxLowPriorityBytes = maxLowPriorityBytes
+            ?? Math.min(DEFAULT_MAX_LOW_PRIORITY_BYTES, Math.floor(maxFileBytes * 0.4));
+        if (!Number.isSafeInteger(resolvedMaxLowPriorityBytes)
+            || resolvedMaxLowPriorityBytes < 256
+            || resolvedMaxLowPriorityBytes >= maxFileBytes) {
+            throw new TypeError('Invalid low-priority log size limit.');
+        }
 
         this.fs = fsModule;
         this.filePath = path.join(path.resolve(rootDir), fileName);
         this.maxFileBytes = maxFileBytes;
         this.maxClientBytes = resolvedMaxClientBytes;
+        this.maxLowPriorityBytes = resolvedMaxLowPriorityBytes;
         this.now = now;
         this.bytesWritten = 0;
         this.clientBytesWritten = 0;
+        this.lowPriorityBytesWritten = 0;
         this.atCapacity = false;
         this.clientAtCapacity = false;
+        this.lowPriorityAtCapacity = false;
         this.disabled = false;
         // Opening with `w` is intentional: every host start begins a fresh log.
         this.fileDescriptor = this.fs.openSync(this.filePath, 'w', 0o600);
@@ -175,8 +188,9 @@ class LogStore {
         }
     }
 
-    server(level, event, details = undefined) {
-        return this.#write('server', level, event, sanitizeServerDetails(details));
+    server(level, event, details = undefined, options = undefined) {
+        const priority = options?.priority ?? 'normal';
+        return this.#write('server', level, event, sanitizeServerDetails(details), priority);
     }
 
     client(level, event, context = undefined) {
@@ -198,12 +212,15 @@ class LogStore {
         }
     }
 
-    #write(source, level, event, details) {
+    #write(source, level, event, details, priority = 'normal') {
         if (this.disabled
             || this.atCapacity
             || (source === 'client' && this.clientAtCapacity)
+            || (source === 'server' && priority === 'low' && this.lowPriorityAtCapacity)
             || this.fileDescriptor === undefined) return false;
-        if (!SOURCES.has(source) || !LEVELS.has(level) || typeof event !== 'string' || !EVENT_PATTERN.test(event)) {
+        if (!SOURCES.has(source) || !LEVELS.has(level) || !PRIORITIES.has(priority)
+            || (source !== 'server' && priority !== 'normal')
+            || typeof event !== 'string' || !EVENT_PATTERN.test(event)) {
             return false;
         }
 
@@ -220,6 +237,14 @@ class LogStore {
         const line = `${JSON.stringify(record)}\n`;
         const byteLength = Buffer.byteLength(line);
 
+        if (source === 'server' && priority === 'low'
+            && this.lowPriorityBytesWritten + byteLength > this.maxLowPriorityBytes) {
+            // Rejected/anonymous prepare traffic is deliberately bounded by its
+            // own budget. Dropping it must not flip the shared server log into a
+            // permanent full state and hide later operational diagnostics.
+            this.lowPriorityAtCapacity = true;
+            return false;
+        }
         if (source === 'client' && this.clientBytesWritten + byteLength > this.maxClientBytes) {
             this.#writeCapacityMarker('client_log_capacity_reached', { maxClientBytes: this.maxClientBytes });
             this.clientAtCapacity = true;
@@ -235,6 +260,7 @@ class LogStore {
             this.fs.writeSync(this.fileDescriptor, line, undefined, 'utf8');
             this.bytesWritten += byteLength;
             if (source === 'client') this.clientBytesWritten += byteLength;
+            if (source === 'server' && priority === 'low') this.lowPriorityBytesWritten += byteLength;
             return true;
         } catch {
             this.disabled = true;
@@ -269,6 +295,7 @@ module.exports = {
     CLIENT_LOG_MEDIA_TYPE,
     DEFAULT_MAX_CLIENT_BYTES,
     DEFAULT_MAX_FILE_BYTES,
+    DEFAULT_MAX_LOW_PRIORITY_BYTES,
     LOG_FILE_NAME,
     MAX_CLIENT_EVENT_BYTES,
     LogStore,

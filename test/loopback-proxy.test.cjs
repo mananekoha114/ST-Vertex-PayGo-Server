@@ -10,8 +10,12 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
 const { PassThrough } = require('node:stream');
 const { createLoopbackTransport } = require('../src/loopback-server.cjs');
+const { LogStore } = require('../src/log-store.cjs');
 const { TicketStore } = require('../src/ticket-store.cjs');
 
 function createFakeUpstream(calls, { statusCode = 202, headers = { 'content-type': 'text/event-stream', 'x-request-id': 'safe-id' }, body = 'data: ok\n\n' } = {}) {
@@ -134,6 +138,31 @@ test('loopback proxy rejects mismatched suffix and invalid secret without forwar
     } finally {
         store.close();
         await transport.close();
+    }
+});
+
+test('anonymous loopback rejects use the bounded low-priority log budget', async () => {
+    const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vertex-paygo-proxy-log-'));
+    const logStore = new LogStore({ rootDir, maxFileBytes: 2048, maxClientBytes: 512, maxLowPriorityBytes: 512 });
+    const store = new TicketStore();
+    const transport = createLoopbackTransport({ ticketStore: store, logStore });
+    await transport.start();
+    try {
+        for (let index = 0; index < 40; index += 1) {
+            const response = await fetch(`${transport.baseUrl}/proxy/invalid-ticket/not-a-google-path`, {
+                method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+            });
+            assert.equal(response.status, 404);
+            await response.text();
+        }
+        assert.equal(logStore.lowPriorityAtCapacity, true);
+        assert.equal(logStore.server('error', 'proxy_diagnostic', { errorCode: 'VERTEX_UPSTREAM_FAILED' }), true);
+        assert.match(logStore.read(), /proxy_diagnostic/u);
+    } finally {
+        store.close();
+        await transport.close();
+        logStore.close();
+        fs.rmSync(rootDir, { recursive: true, force: true });
     }
 });
 

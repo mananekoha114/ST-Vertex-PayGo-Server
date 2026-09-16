@@ -26,11 +26,13 @@ test('ST runtime loader accepts SillyTavern 1.16+ and compatible Luker hosts', a
         const runtime = await loadStRuntime({
             rootDir: 'C:\\fake-host',
             readFile: async () => JSON.stringify(host),
-            importModule: async () => ({ getGoogleApiConfig: helper }),
+            importModule: async specifier => specifier.endsWith('/secrets.js')
+                ? { SECRET_KEYS: { MAKERSUITE: 'makersuite' }, readSecret: () => '' }
+                : { getGoogleApiConfig: helper },
         });
         assert.equal(runtime.hostName, host.name);
         assert.equal(runtime.stVersion, host.version);
-        assert.equal(runtime.getGoogleApiConfig, helper);
+        assert.notEqual(runtime.getGoogleApiConfig, helper);
     }
 });
 
@@ -46,7 +48,9 @@ test('ST runtime loader rejects old, unknown, malformed, or incomplete hosts', a
     for (const host of unsupportedHosts) {
         await assert.rejects(loadStRuntime({
             readFile: async () => JSON.stringify(host),
-            importModule: async () => ({ getGoogleApiConfig: helper }),
+            importModule: async specifier => specifier.endsWith('/secrets.js')
+                ? { SECRET_KEYS: { MAKERSUITE: 'makersuite' }, readSecret: () => '' }
+                : { getGoogleApiConfig: helper },
         }), { code: 'INCOMPATIBLE_SILLYTAVERN' });
     }
 
@@ -54,6 +58,43 @@ test('ST runtime loader rejects old, unknown, malformed, or incomplete hosts', a
         readFile: async () => JSON.stringify({ name: 'sillytavern', version: '1.18.0' }),
         importModule: async () => ({}),
     }), { code: 'INCOMPATIBLE_SILLYTAVERN' });
+});
+
+test('honors explicit AI Studio secrets for both supported host names', async () => {
+    const calls = [];
+    const helper = async request => {
+        calls.push(request);
+        return { url: 'https://generativelanguage.googleapis.com/v1beta/models/generateContent', headers: { 'x-goog-api-key': 'default' } };
+    };
+    for (const name of ['sillytavern', 'luker']) {
+        const runtime = await loadStRuntime({
+            rootDir: 'C:\\fake-host',
+            readFile: async () => JSON.stringify({ name, version: name === 'luker' ? '2.7.0' : '1.18.0' }),
+            importModule: async specifier => specifier.endsWith('/secrets.js')
+                ? {
+                    SECRET_KEYS: { MAKERSUITE: 'makersuite' },
+                    readSecret: (_directories, key, id) => key === 'makersuite' && id === 'selected' ? 'selected-key' : '',
+                }
+                : { getGoogleApiConfig: helper },
+        });
+        const config = await runtime.getGoogleApiConfig({ body: { api: 'makersuite', secret_id: 'selected' }, user: { directories: {} } }, 'gemini', 'generateContent');
+        assert.equal(config.headers['x-goog-api-key'], 'selected-key');
+    }
+    assert.equal(calls.length, 2);
+});
+
+test('fails closed for missing explicit secrets and unsupported Vertex authentication', async () => {
+    let helperCalls = 0;
+    const runtime = await loadStRuntime({
+        rootDir: 'C:\\fake-host',
+        readFile: async () => JSON.stringify({ name: 'sillytavern', version: '1.18.0' }),
+        importModule: async specifier => specifier.endsWith('/secrets.js')
+            ? { SECRET_KEYS: { MAKERSUITE: 'makersuite' }, readSecret: () => '' }
+            : { getGoogleApiConfig: async () => { helperCalls++; return { headers: {} }; } },
+    });
+    await assert.rejects(runtime.getGoogleApiConfig({ body: { api: 'makersuite', secret_id: 'missing' }, user: { directories: {} } }), { code: 'EXPLICIT_SECRET_NOT_FOUND' });
+    await assert.rejects(runtime.getGoogleApiConfig({ body: { api: 'vertexai', secret_id: 'selected', vertexai_auth_mode: 'full' }, user: { directories: {} } }), { code: 'EXPLICIT_SECRET_UNSUPPORTED' });
+    assert.equal(helperCalls, 0);
 });
 
 test('route registration exposes handshake, prepare, and fail-closed sink', () => {

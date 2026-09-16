@@ -74,11 +74,57 @@ async function loadStRuntime({
         throw new PluginError(500, 'INCOMPATIBLE_SILLYTAVERN', 'The host does not export the required Vertex AI configuration helper.');
     }
 
+    const secretsModuleUrl = pathToFileURL(path.join(resolvedRoot, 'src', 'endpoints', 'secrets.js')).href;
+    let secretsModule;
+    try {
+        secretsModule = await importModule(secretsModuleUrl);
+    } catch (error) {
+        throw new PluginError(500, 'INCOMPATIBLE_SILLYTAVERN', 'Could not load the host\'s secret manager.', { cause: error });
+    }
+    if (typeof secretsModule.readSecret !== 'function' || !secretsModule.SECRET_KEYS) {
+        throw new PluginError(500, 'INCOMPATIBLE_SILLYTAVERN', 'The host does not export the required secret manager.');
+    }
+
+    const getGoogleApiConfig = async (request, model, endpoint) => {
+        const rawSecretId = request?.body?.secret_id ?? request?.body?.secretId;
+        const secretId = typeof rawSecretId === 'string' ? rawSecretId.trim() : '';
+        if (!secretId) {
+            return googleModule.getGoogleApiConfig(request, model, endpoint);
+        }
+
+        // The host's Vertex full mode helper always reads the active service
+        // account. Refuse an explicit selection rather than silently using it.
+        if (request?.body?.api === 'vertexai') {
+            const error = new Error('Explicit secret selection is unsupported for Vertex AI authentication.');
+            error.code = 'EXPLICIT_SECRET_UNSUPPORTED';
+            throw error;
+        }
+
+        const directories = request?.user?.directories;
+        if (!directories) {
+            const error = new Error('An authenticated user is required for explicit secret selection.');
+            error.code = 'EXPLICIT_SECRET_UNAVAILABLE';
+            throw error;
+        }
+        const apiKey = secretsModule.readSecret(directories, secretsModule.SECRET_KEYS.MAKERSUITE, secretId);
+        if (typeof apiKey !== 'string' || !apiKey) {
+            const error = new Error('The requested Google AI Studio secret was not found.');
+            error.code = 'EXPLICIT_SECRET_NOT_FOUND';
+            throw error;
+        }
+
+        const config = await googleModule.getGoogleApiConfig(request, model, endpoint);
+        return {
+            ...config,
+            headers: { ...config.headers, 'x-goog-api-key': apiKey },
+        };
+    };
+
     return Object.freeze({
         rootDir: resolvedRoot,
         hostName: packageData.name,
         stVersion: packageData.version,
-        getGoogleApiConfig: googleModule.getGoogleApiConfig,
+        getGoogleApiConfig,
     });
 }
 

@@ -166,7 +166,9 @@ function createProxyHandler({
         const logTerminal = (level, event, additional = undefined) => {
             if (terminalLogged) return;
             terminalLogged = true;
-            logStore?.server(level, event, makeLogContext(additional));
+            logStore?.server(level, event, makeLogContext(additional), {
+                priority: logContext ? 'normal' : 'low',
+            });
         };
 
         const fail = error => {
@@ -178,7 +180,9 @@ function createProxyHandler({
             sendNodeError(response, error);
         };
 
-        logStore?.server('info', 'proxy_request_received');
+        // Until a ticket has been authenticated, this is browser-controlled
+        // reject noise. Keep it in the bounded low-priority budget.
+        logStore?.server('info', 'proxy_request_received', undefined, { priority: 'low' });
         try {
             if (request.method !== 'POST') {
                 throw new PluginError(405, 'METHOD_NOT_ALLOWED', 'Only POST is accepted by the loopback proxy.');

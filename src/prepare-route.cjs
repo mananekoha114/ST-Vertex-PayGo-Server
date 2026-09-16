@@ -9,10 +9,30 @@
 'use strict';
 
 const { buildPayGoHeaders } = require('./header-policy.cjs');
+const { createHash } = require('node:crypto');
 const { sendExpressError, PluginError } = require('./errors.cjs');
 const { describeError } = require('./log-store.cjs');
 const { PLUGIN_ID, PROTOCOL_VERSION, validatePreparePayload } = require('./protocol.cjs');
 const { prepareGoogleHeaders, prepareGoogleTarget } = require('./target-policy.cjs');
+const EXPLICIT_SECRET_ERROR_CODES = new Set([
+    'EXPLICIT_SECRET_UNSUPPORTED',
+    'EXPLICIT_SECRET_NOT_FOUND',
+    'EXPLICIT_SECRET_UNAVAILABLE',
+]);
+
+function resolveUserKey(user) {
+    const profile = user?.profile;
+    for (const value of [profile?.handle, profile?.username, profile?.id, user?.id]) {
+        if (typeof value === 'string' && value.length > 0 && value.length <= 256) return `identity:${value}`;
+    }
+    const root = user?.directories?.root;
+    if (typeof root === 'string' && root.length > 0) {
+        return `directory:${createHash('sha256').update(root).digest('hex')}`;
+    }
+    // Real authenticated ST requests have a profile handle or user directory.
+    // Keep a conservative shared bucket for minimal test/custom middleware users.
+    return 'anonymous';
+}
 
 function prepareLogContext(config, startedAt, additional = undefined) {
     return {
@@ -33,12 +53,18 @@ function createPrepareHandler({ stRuntime, ticketStore, loopbackTransport, logSt
     return async function prepareHandler(request, response) {
         const startedAt = Date.now();
         let config;
-        logStore?.server('info', 'prepare_started');
+        let reservation;
+        logStore?.server('info', 'prepare_started', undefined, { priority: 'low' });
         try {
             config = validatePreparePayload(request.body);
             if (!request.user || !request.user.directories) {
                 throw new PluginError(401, 'AUTHENTICATED_USER_REQUIRED', 'An authenticated SillyTavern user is required.');
             }
+
+            // Reserve both global and per-user capacity before invoking the host's
+            // potentially expensive credential loader. The reservation remains in
+            // the limits while this async operation is in flight.
+            reservation = ticketStore.reserve(resolveUserKey(request.user));
 
             const syntheticBody = {
                 api: config.source,
@@ -62,6 +88,9 @@ function createPrepareHandler({ stRuntime, ticketStore, loopbackTransport, logSt
             try {
                 googleConfig = await stRuntime.getGoogleApiConfig(syntheticRequest, config.model, endpoint);
             } catch (error) {
+                if (EXPLICIT_SECRET_ERROR_CODES.has(error?.code)) {
+                    throw new PluginError(400, error.code, error.message, { cause: error });
+                }
                 throw new PluginError(
                     400,
                     config.source === 'vertexai' ? 'VERTEX_AUTH_CONFIGURATION_FAILED' : 'GOOGLE_AUTH_CONFIGURATION_FAILED',
@@ -74,9 +103,11 @@ function createPrepareHandler({ stRuntime, ticketStore, loopbackTransport, logSt
             const headers = prepareGoogleHeaders(googleConfig.headers, buildPayGoHeaders(config));
             if (request.aborted || response.destroyed) {
                 logStore?.server('warn', 'prepare_client_disconnected', prepareLogContext(config, startedAt));
+                ticketStore.release(reservation);
+                reservation = undefined;
                 return undefined;
             }
-            const issued = ticketStore.create({
+            const issued = ticketStore.commit(reservation, {
                 targetUrl,
                 headers,
                 source: config.source,
@@ -86,6 +117,7 @@ function createPrepareHandler({ stRuntime, ticketStore, loopbackTransport, logSt
                 tier: config.tier,
                 region: config.region,
             });
+            reservation = undefined;
             const proxyUrl = `${loopbackTransport.baseUrl}/proxy/${issued.ticket}`;
 
             response.set?.('Cache-Control', 'no-store');
@@ -101,10 +133,14 @@ function createPrepareHandler({ stRuntime, ticketStore, loopbackTransport, logSt
                 expiresAt: issued.expiresAt,
             });
         } catch (error) {
-            logStore?.server('error', 'prepare_failed', prepareLogContext(config, startedAt, describeError(error)));
+            if (reservation) ticketStore.release(reservation);
+            // Every failed prepare is derived from browser-controlled setup or
+            // authentication. Keep it out of the shared diagnostic budget so a
+            // repeated rejection cannot hide successful proxy failures.
+            logStore?.server('error', 'prepare_failed', prepareLogContext(config, startedAt, describeError(error)), { priority: 'low' });
             return sendExpressError(response, error);
         }
     };
 }
 
-module.exports = { createPrepareHandler };
+module.exports = { createPrepareHandler, resolveUserKey };

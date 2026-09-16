@@ -217,3 +217,26 @@ test('client log quota leaves capacity available for later server diagnostics', 
         fs.rmSync(rootDir, { recursive: true, force: true });
     }
 });
+
+test('low-priority prepare noise has its own bounded budget', () => {
+    const rootDir = makeTemporaryRoot();
+    const store = new LogStore({ rootDir, maxFileBytes: 2048, maxClientBytes: 512, maxLowPriorityBytes: 512 });
+    try {
+        let lowRejected = false;
+        for (let index = 0; index < 100; index += 1) {
+            if (!store.server('info', 'prepare_started', undefined, { priority: 'low' })) {
+                lowRejected = true;
+                break;
+            }
+            store.server('error', 'prepare_failed', { errorCode: 'INVALID_PREPARE_REQUEST' }, { priority: 'low' });
+        }
+        assert.equal(lowRejected, true);
+        assert.equal(store.server('error', 'proxy_failed', { errorCode: 'VERTEX_UPSTREAM_FAILED' }), true);
+        assert.equal(store.lowPriorityAtCapacity, true);
+        assert.ok(fs.statSync(store.filePath).size <= 2048);
+        assert.match(store.read(), /proxy_failed/u);
+    } finally {
+        store.close();
+        fs.rmSync(rootDir, { recursive: true, force: true });
+    }
+});

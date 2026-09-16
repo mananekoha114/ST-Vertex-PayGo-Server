@@ -78,3 +78,61 @@ test('default ticket lifetime is five minutes', () => {
         store.close();
     }
 });
+
+test('reservations enforce total and per-user capacity before tickets are committed', () => {
+    const store = new TicketStore({ maxEntries: 2, maxEntriesPerUser: 1 });
+    try {
+        const firstReservation = store.reserve('user-a');
+        assert.equal(store.pendingSize, 1);
+        assert.throws(() => store.reserve('user-a'), { code: 'USER_TICKET_CAPACITY_EXCEEDED' });
+        const secondReservation = store.reserve('user-b');
+        assert.equal(store.pendingSize, 2);
+        assert.throws(() => store.reserve('user-c'), { code: 'TICKET_CAPACITY_EXCEEDED' });
+
+        const first = store.commit(firstReservation, { sequence: 1 });
+        store.release(secondReservation);
+        assert.equal(store.pendingSize, 1);
+        assert.deepEqual(store.consume(first.ticket, first.proxySecret), { sequence: 1 });
+        assert.equal(store.pendingSize, 0);
+    } finally {
+        store.close();
+    }
+});
+
+test('ticket issuance is rate limited per user and the window expires', () => {
+    let now = 1_000;
+    const store = new TicketStore({ maxIssuesPerWindow: 2, issueWindowMs: 100, now: () => now });
+    try {
+        const first = store.create({ sequence: 1 }, 'user-a');
+        const second = store.create({ sequence: 2 }, 'user-a');
+        assert.throws(() => store.create({ sequence: 3 }, 'user-a'), { code: 'TICKET_ISSUE_RATE_EXCEEDED' });
+        // A different user has an independent issuance budget.
+        assert.doesNotThrow(() => store.create({ sequence: 4 }, 'user-b'));
+        now = 1_101;
+        assert.doesNotThrow(() => store.create({ sequence: 5 }, 'user-a'));
+        store.consume(first.ticket, first.proxySecret);
+        store.consume(second.ticket, second.proxySecret);
+    } finally {
+        store.close();
+    }
+});
+
+test('expired tickets and hung reservations release the user quota', () => {
+    let now = 1_000;
+    const store = new TicketStore({ ttlMs: 10, maxEntriesPerUser: 1, now: () => now });
+    try {
+        const issued = store.create({ sequence: 1 }, 'user-a');
+        now = 1_010;
+        assert.throws(() => store.consume(issued.ticket, issued.proxySecret), { code: 'EXPIRED_PROXY_TICKET' });
+        assert.doesNotThrow(() => store.create({ sequence: 2 }, 'user-a'));
+
+        const reservation = store.reserve('user-b');
+        now = 1_021;
+        store.cleanup();
+        assert.equal(store.pendingSize, 0);
+        assert.throws(() => store.commit(reservation, { sequence: 3 }), { code: 'TICKET_RESERVATION_INVALID' });
+        assert.doesNotThrow(() => store.create({ sequence: 4 }, 'user-b'));
+    } finally {
+        store.close();
+    }
+});

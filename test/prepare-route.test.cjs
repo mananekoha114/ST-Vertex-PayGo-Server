@@ -10,7 +10,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { createPrepareHandler } = require('../src/prepare-route.cjs');
+const { createPrepareHandler, resolveUserKey } = require('../src/prepare-route.cjs');
 const { TicketStore } = require('../src/ticket-store.cjs');
 
 function makeResponse() {
@@ -43,6 +43,24 @@ function captureLog(records) {
         server(level, event, context) { records.push({ level, event, context }); },
     };
 }
+
+test('explicit credential errors reach the caller and long directory identities remain isolated', async () => {
+    const root = 'x'.repeat(1000);
+    const owner = resolveUserKey({ directories: { root } });
+    assert.ok(owner.length <= 512);
+    assert.notEqual(owner, resolveUserKey({ directories: { root: `${root}y` } }));
+    const ticketStore = new TicketStore();
+    try {
+        const handler = createPrepareHandler({ ticketStore, stRuntime: { getGoogleApiConfig: async () => {
+            throw Object.assign(new Error('Explicit selection unsupported.'), { code: 'EXPLICIT_SECRET_UNSUPPORTED' });
+        } } });
+        const response = makeResponse();
+        await handler({ body: makeBody({ secret_id: 'selected' }), user: { directories: { root } } }, response);
+        assert.equal(response.statusCode, 400);
+        assert.equal(response.body.code, 'EXPLICIT_SECRET_UNSUPPORTED');
+        assert.equal(ticketStore.pendingSize, 0);
+    } finally { ticketStore.close(); }
+});
 
 test('prepare synthesizes ST auth request and issues an opaque loopback ticket', async () => {
     const calls = [];
@@ -116,6 +134,26 @@ test('prepare converts authentication failures to a stable non-sensitive error',
     }
 });
 
+test('prepare preserves safe explicit-secret configuration errors', async () => {
+    const ticketStore = new TicketStore();
+    try {
+        const error = new Error('The requested Google AI Studio secret was not found.');
+        error.code = 'EXPLICIT_SECRET_NOT_FOUND';
+        const handler = createPrepareHandler({
+            stRuntime: { async getGoogleApiConfig() { throw error; } },
+            ticketStore,
+            loopbackTransport: { baseUrl: 'http://127.0.0.1:1' },
+        });
+        const response = makeResponse();
+        await handler({ body: makeBody({ chat_completion_source: 'makersuite', tier: 'flex', paygoOnly: false, secret_id: 'selected' }), user: { directories: {} } }, response);
+        assert.equal(response.statusCode, 400);
+        assert.equal(response.body.code, 'EXPLICIT_SECRET_NOT_FOUND');
+        assert.match(response.body.message, /secret was not found/u);
+    } finally {
+        ticketStore.close();
+    }
+});
+
 test('prepare does not issue a ticket after its authenticated client disconnects', async () => {
     const ticketStore = new TicketStore();
     try {
@@ -137,6 +175,47 @@ test('prepare does not issue a ticket after its authenticated client disconnects
         assert.equal(ticketStore.size, 0);
         assert.equal(response.body, undefined);
     } finally {
+        ticketStore.close();
+    }
+});
+
+test('prepare reserves per-user capacity before an async authentication lookup', async () => {
+    const ticketStore = new TicketStore({ maxEntries: 8, maxEntriesPerUser: 1 });
+    let releaseAuthentication;
+    let authenticationCalls = 0;
+    const authenticationReady = new Promise(resolve => { releaseAuthentication = resolve; });
+    const handler = createPrepareHandler({
+        stRuntime: {
+            async getGoogleApiConfig() {
+                authenticationCalls += 1;
+                await authenticationReady;
+                return {
+                    url: 'https://aiplatform.googleapis.com/v1/projects/demo/locations/global/publishers/google/models/gemini-2.5-pro:streamGenerateContent',
+                    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': 'private' },
+                };
+            },
+        },
+        ticketStore,
+        loopbackTransport: { baseUrl: 'http://127.0.0.1:54321' },
+    });
+    const firstResponse = makeResponse();
+    const firstRequest = { body: makeBody(), user: { directories: { root: 'user-a' } } };
+    const first = handler(firstRequest, firstResponse);
+    await new Promise(resolve => setImmediate(resolve));
+
+    try {
+        const secondResponse = makeResponse();
+        await handler({ body: makeBody(), user: { directories: { root: 'user-a' } } }, secondResponse);
+        assert.equal(secondResponse.statusCode, 429);
+        assert.equal(secondResponse.body.code, 'USER_TICKET_CAPACITY_EXCEEDED');
+        assert.equal(authenticationCalls, 1);
+
+        releaseAuthentication();
+        await first;
+        assert.equal(firstResponse.statusCode, 200);
+        assert.equal(ticketStore.size, 1);
+    } finally {
+        releaseAuthentication();
         ticketStore.close();
     }
 });
