@@ -10,9 +10,9 @@
 
 const { PluginError } = require('./errors.cjs');
 
-const PROTOCOL_VERSION = 1;
+const PROTOCOL_VERSION = 2;
 const PLUGIN_ID = 'vertex-paygo';
-const PLUGIN_VERSION = '0.3.0';
+const PLUGIN_VERSION = '0.4.0';
 const COMPATIBLE_ST_RANGE = '>=1.16.0';
 const TIERS = Object.freeze(['standard', 'flex', 'priority']);
 const AUTH_MODES = Object.freeze(['express', 'full']);
@@ -22,6 +22,47 @@ function requireCanonicalString(value, field, pattern, maxLength = 128) {
         throw new PluginError(400, 'INVALID_PREPARE_REQUEST', `Invalid ${field}.`);
     }
     return value;
+}
+
+function validateChatId(value) {
+    return requireCanonicalString(value, 'usage chat ID', /^[A-Za-z0-9][A-Za-z0-9._:-]*$/u, 128);
+}
+
+function validateUsagePrice(value) {
+    if (value === undefined || value === null) return null;
+    if (typeof value !== 'object' || Array.isArray(value)) {
+        throw new PluginError(400, 'INVALID_PREPARE_REQUEST', 'Invalid usage price.');
+    }
+    const allowed = new Set(['input', 'cachedInput', 'output', 'longContextThreshold', 'longInput', 'longCachedInput', 'longOutput']);
+    if (Object.keys(value).some(key => !allowed.has(key))) {
+        throw new PluginError(400, 'INVALID_PREPARE_REQUEST', 'Invalid usage price field.');
+    }
+    for (const field of ['input', 'cachedInput', 'output']) {
+        if (!Number.isFinite(value[field]) || value[field] < 0) {
+            throw new PluginError(400, 'INVALID_PREPARE_REQUEST', `Invalid usage price ${field}.`);
+        }
+    }
+    const result = { input: value.input, cachedInput: value.cachedInput, output: value.output };
+    if (value.longContextThreshold !== undefined) {
+        if (!Number.isSafeInteger(value.longContextThreshold) || value.longContextThreshold <= 0) {
+            throw new PluginError(400, 'INVALID_PREPARE_REQUEST', 'Invalid usage price longContextThreshold.');
+        }
+        result.longContextThreshold = value.longContextThreshold;
+        const longFields = ['longInput', 'longCachedInput', 'longOutput'];
+        const suppliedLongFields = longFields.filter(field => value[field] !== undefined);
+        if (suppliedLongFields.length !== 0 && suppliedLongFields.length !== longFields.length) {
+            throw new PluginError(400, 'INVALID_PREPARE_REQUEST', 'Long-context prices must be supplied together.');
+        }
+        for (const field of suppliedLongFields) {
+            if (!Number.isFinite(value[field]) || value[field] < 0) {
+                throw new PluginError(400, 'INVALID_PREPARE_REQUEST', `Invalid usage price ${field}.`);
+            }
+            result[field] = value[field];
+        }
+    } else if (['longInput', 'longCachedInput', 'longOutput'].some(field => value[field] !== undefined)) {
+        throw new PluginError(400, 'INVALID_PREPARE_REQUEST', 'Long-context prices require longContextThreshold.');
+    }
+    return Object.freeze(result);
 }
 
 function validatePreparePayload(body) {
@@ -50,15 +91,11 @@ function validatePreparePayload(body) {
         throw new PluginError(400, 'INVALID_PREPARE_REQUEST', 'stream and paygoOnly must be booleans.');
     }
     if (source === 'makersuite' && (tier === 'priority' || body.paygoOnly)) {
-        throw new PluginError(400, 'AI_STUDIO_TIER_UNSUPPORTED', 'Google AI Studio supports Flex without Vertex PayGo-only in this plugin.');
+        throw new PluginError(400, 'AI_STUDIO_TIER_UNSUPPORTED', 'Google AI Studio supports Standard and Flex without Vertex PayGo-only in this plugin.');
     }
     if (source === 'vertexai' && (tier === 'flex' || tier === 'priority') && region !== 'global') {
         throw new PluginError(409, 'GLOBAL_REGION_REQUIRED', 'Flex and Priority require the global Vertex AI region.');
     }
-    if (tier === 'standard' && !body.paygoOnly) {
-        throw new PluginError(400, 'NATIVE_ROUTE_REQUIRED', 'Standard without PayGo-only must use SillyTavern\'s native Vertex AI route.');
-    }
-
     let expressProjectId;
     if (source === 'vertexai' && body.vertexai_express_project_id !== undefined && body.vertexai_express_project_id !== '') {
         expressProjectId = requireCanonicalString(
@@ -74,6 +111,10 @@ function validatePreparePayload(body) {
         secretId = requireCanonicalString(body.secret_id, 'secret ID', /^[A-Za-z0-9_-]+$/u, 128);
     }
 
+    const usageChatId = body.usageChatId === undefined || body.usageChatId === null || body.usageChatId === ''
+        ? undefined : validateChatId(body.usageChatId);
+    const usagePrice = validateUsagePrice(body.usagePrice);
+
     return Object.freeze({
         protocolVersion: PROTOCOL_VERSION,
         source,
@@ -85,6 +126,8 @@ function validatePreparePayload(body) {
         paygoOnly: body.paygoOnly,
         expressProjectId,
         secretId,
+        usageChatId,
+        usagePrice,
     });
 }
 
@@ -95,5 +138,7 @@ module.exports = {
     PLUGIN_VERSION,
     PROTOCOL_VERSION,
     TIERS,
+    validateChatId,
     validatePreparePayload,
+    validateUsagePrice,
 };

@@ -13,8 +13,8 @@ const { PluginError } = require('./errors.cjs');
 const { describeError } = require('./log-store.cjs');
 const { createProxyHandler } = require('./proxy-handler.cjs');
 
-function createLoopbackTransport({ ticketStore, logStore, upstreamRequest, maxBodyBytes, upstreamTimeoutMs } = {}) {
-    const proxyHandler = createProxyHandler({ ticketStore, logStore, upstreamRequest, maxBodyBytes, upstreamTimeoutMs });
+function createLoopbackTransport({ ticketStore, logStore, usageStore, upstreamRequest, maxBodyBytes, upstreamTimeoutMs } = {}) {
+    const proxyHandler = createProxyHandler({ ticketStore, logStore, usageStore, upstreamRequest, maxBodyBytes, upstreamTimeoutMs });
     let server;
     let baseUrl;
 

@@ -49,15 +49,16 @@ function prepareLogContext(config, startedAt, additional = undefined) {
     };
 }
 
-function createPrepareHandler({ stRuntime, ticketStore, loopbackTransport, logStore }) {
+function createPrepareHandler({ stRuntime, ticketStore, loopbackTransport, logStore, usageStore }) {
     return async function prepareHandler(request, response) {
         const startedAt = Date.now();
         let config;
         let reservation;
+        let usageReference;
         logStore?.server('info', 'prepare_started', undefined, { priority: 'low' });
         try {
             config = validatePreparePayload(request.body);
-            if (!request.user || !request.user.directories) {
+            if (!request.user?.directories || typeof request.user.directories.root !== 'string' || !request.user.directories.root) {
                 throw new PluginError(401, 'AUTHENTICATED_USER_REQUIRED', 'An authenticated SillyTavern user is required.');
             }
 
@@ -107,6 +108,21 @@ function createPrepareHandler({ stRuntime, ticketStore, loopbackTransport, logSt
                 reservation = undefined;
                 return undefined;
             }
+            if (config.usageChatId) {
+                try {
+                    usageReference = usageStore?.create(request.user, {
+                        chatId: config.usageChatId,
+                        model: config.model,
+                        source: config.source,
+                        tier: config.tier,
+                        region: config.region ?? null,
+                        stream: config.stream,
+                        price: config.usagePrice,
+                    });
+                } catch (error) {
+                    logStore?.server('error', 'usage_ledger_create_failed', prepareLogContext(config, startedAt, describeError(error)), { priority: 'low' });
+                }
+            }
             const issued = ticketStore.commit(reservation, {
                 targetUrl,
                 headers,
@@ -116,6 +132,7 @@ function createPrepareHandler({ stRuntime, ticketStore, loopbackTransport, logSt
                 endpoint,
                 tier: config.tier,
                 region: config.region,
+                usageReference: usageReference ? { file: usageReference.file, id: usageReference.id } : null,
             });
             reservation = undefined;
             const proxyUrl = `${loopbackTransport.baseUrl}/proxy/${issued.ticket}`;
@@ -131,9 +148,11 @@ function createPrepareHandler({ stRuntime, ticketStore, loopbackTransport, logSt
                 proxySecret: issued.proxySecret,
                 proxyUrl,
                 expiresAt: issued.expiresAt,
+                usageId: usageReference?.id ?? null,
             });
         } catch (error) {
             if (reservation) ticketStore.release(reservation);
+            if (usageReference) usageStore?.update(usageReference, { status: 'failed', errorCode: error?.code || 'PREPARE_FAILED' });
             // Every failed prepare is derived from browser-controlled setup or
             // authentication. Keep it out of the shared diagnostic budget so a
             // repeated rejection cannot hide successful proxy failures.

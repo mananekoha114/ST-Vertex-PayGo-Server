@@ -14,6 +14,7 @@ const { PLUGIN_ID } = require('./src/protocol.cjs');
 const { registerRoutes } = require('./src/routes.cjs');
 const { loadStRuntime } = require('./src/st-runtime.cjs');
 const { TicketStore } = require('./src/ticket-store.cjs');
+const { UsageStore } = require('./src/usage-store.cjs');
 
 const info = Object.freeze({
     id: PLUGIN_ID,
@@ -30,6 +31,7 @@ async function init(router) {
     logStore.server('info', 'plugin_initializing');
     let ticketStore;
     let loopbackTransport;
+    const usageStore = new UsageStore();
     try {
         const stRuntime = await loadStRuntime();
         logStore.server('info', 'host_runtime_loaded', {
@@ -37,10 +39,10 @@ async function init(router) {
             hostVersion: stRuntime.stVersion,
         });
         ticketStore = new TicketStore();
-        loopbackTransport = createLoopbackTransport({ ticketStore, logStore });
+        loopbackTransport = createLoopbackTransport({ ticketStore, logStore, usageStore });
         await loopbackTransport.start();
-        registerRoutes(router, { stRuntime, ticketStore, loopbackTransport, logStore });
-        activeState = { ticketStore, loopbackTransport, logStore };
+        registerRoutes(router, { stRuntime, ticketStore, loopbackTransport, logStore, usageStore });
+        activeState = { ticketStore, loopbackTransport, logStore, usageStore };
         logStore.server('info', 'plugin_ready', {
             hostName: stRuntime.hostName,
             hostVersion: stRuntime.stVersion,

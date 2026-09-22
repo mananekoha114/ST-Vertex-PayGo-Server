@@ -26,7 +26,7 @@ function makeResponse() {
 
 function makeBody(overrides = {}) {
     return {
-        protocolVersion: 1,
+        protocolVersion: 2,
         chat_completion_source: 'vertexai',
         model: 'gemini-2.5-pro',
         stream: true,
@@ -122,7 +122,7 @@ test('prepare converts authentication failures to a stable non-sensitive error',
             logStore: captureLog(logs),
         });
         const response = makeResponse();
-        await handler({ body: makeBody(), user: { directories: {} } }, response);
+        await handler({ body: makeBody(), user: { directories: { root: 'test-user' } } }, response);
         assert.equal(response.statusCode, 400);
         assert.equal(response.body.code, 'VERTEX_AUTH_CONFIGURATION_FAILED');
         assert.doesNotMatch(response.body.message, /private key/u);
@@ -145,7 +145,7 @@ test('prepare preserves safe explicit-secret configuration errors', async () => 
             loopbackTransport: { baseUrl: 'http://127.0.0.1:1' },
         });
         const response = makeResponse();
-        await handler({ body: makeBody({ chat_completion_source: 'makersuite', tier: 'flex', paygoOnly: false, secret_id: 'selected' }), user: { directories: {} } }, response);
+        await handler({ body: makeBody({ chat_completion_source: 'makersuite', tier: 'flex', paygoOnly: false, secret_id: 'selected' }), user: { directories: { root: 'test-user' } } }, response);
         assert.equal(response.statusCode, 400);
         assert.equal(response.body.code, 'EXPLICIT_SECRET_NOT_FOUND');
         assert.match(response.body.message, /secret was not found/u);
@@ -171,7 +171,7 @@ test('prepare does not issue a ticket after its authenticated client disconnects
         });
         const response = makeResponse();
         response.destroyed = true;
-        await handler({ body: makeBody(), user: { directories: {} }, aborted: false }, response);
+        await handler({ body: makeBody(), user: { directories: { root: 'test-user' } }, aborted: false }, response);
         assert.equal(ticketStore.size, 0);
         assert.equal(response.body, undefined);
     } finally {
@@ -218,4 +218,50 @@ test('prepare reserves per-user capacity before an async authentication lookup',
         releaseAuthentication();
         ticketStore.close();
     }
+});
+
+test('prepare without usageChatId proxies without creating an unreachable usage record', async () => {
+    const ticketStore = new TicketStore();
+    let createCalls = 0;
+    try {
+        const handler = createPrepareHandler({
+            ticketStore,
+            usageStore: { create() { createCalls += 1; throw new Error('must not be called'); } },
+            loopbackTransport: { baseUrl: 'http://127.0.0.1:1' },
+            stRuntime: { async getGoogleApiConfig(_request, model, endpoint) {
+                return {
+                    url: `https://aiplatform.googleapis.com/v1/projects/demo/locations/global/publishers/google/models/${model}:${endpoint}`,
+                    headers: { 'Content-Type': 'application/json', Authorization: 'Bearer private' },
+                };
+            } },
+        });
+        const response = makeResponse();
+        await handler({ body: makeBody(), user: { directories: { root: 'test-user' } } }, response);
+        assert.equal(response.statusCode, 200);
+        assert.equal(response.body.usageId, null);
+        assert.equal(createCalls, 0);
+        const ticket = ticketStore.consume(response.body.ticket, response.body.proxySecret);
+        assert.equal(ticket.usageReference, null);
+    } finally { ticketStore.close(); }
+});
+
+test('usage ledger creation failure does not block proxy preparation', async () => {
+    const ticketStore = new TicketStore();
+    try {
+        const handler = createPrepareHandler({
+            ticketStore,
+            usageStore: { create() { const error = new Error('disk unavailable'); error.code = 'EIO'; throw error; } },
+            loopbackTransport: { baseUrl: 'http://127.0.0.1:1' },
+            stRuntime: { async getGoogleApiConfig(_request, model, endpoint) {
+                return {
+                    url: `https://aiplatform.googleapis.com/v1/projects/demo/locations/global/publishers/google/models/${model}:${endpoint}`,
+                    headers: { 'Content-Type': 'application/json', Authorization: 'Bearer private' },
+                };
+            } },
+        });
+        const response = makeResponse();
+        await handler({ body: makeBody({ usageChatId: 'chat-write-failure' }), user: { directories: { root: 'test-user' } } }, response);
+        assert.equal(response.statusCode, 200);
+        assert.equal(response.body.usageId, null);
+    } finally { ticketStore.close(); }
 });

@@ -13,6 +13,7 @@ const { Transform } = require('node:stream');
 const { PluginError, sendNodeError } = require('./errors.cjs');
 const { describeError } = require('./log-store.cjs');
 const { validatePreparedGoogleTarget } = require('./target-policy.cjs');
+const { UsageCapture } = require('./usage-capture.cjs');
 
 const HOP_BY_HOP_HEADERS = new Set([
     'connection',
@@ -145,6 +146,7 @@ function copyUpstreamHeaders(headers) {
 function createProxyHandler({
     ticketStore,
     logStore,
+    usageStore,
     upstreamRequest = https.request,
     maxBodyBytes = 500 * 1024 * 1024,
     upstreamTimeoutMs = 31 * 60_000,
@@ -157,6 +159,9 @@ function createProxyHandler({
         let failureHandled = false;
         let clientGone = false;
         let terminalLogged = false;
+        let usageFinalized = false;
+        let usageReference;
+        let usageCapture;
 
         const makeLogContext = additional => ({
             ...(logContext || {}),
@@ -170,10 +175,20 @@ function createProxyHandler({
                 priority: logContext ? 'normal' : 'low',
             });
         };
+        const finalizeUsage = (status, errorCode, usage = undefined) => {
+            if (usageFinalized || !usageReference) return;
+            usageFinalized = true;
+            try {
+                usageStore?.update(usageReference, { status, errorCode, usage });
+            } catch (error) {
+                logStore?.server('error', 'usage_ledger_update_failed', makeLogContext(describeError(error)), { priority: 'low' });
+            }
+        };
 
         const fail = error => {
             if (failureHandled || clientGone) return;
             failureHandled = true;
+            finalizeUsage('failed', error?.code || 'VERTEX_UPSTREAM_FAILED', usageCapture?.finish());
             logTerminal('error', 'proxy_failed', describeError(error));
             upstream?.destroy();
             bodyStream?.destroy();
@@ -219,6 +234,7 @@ function createProxyHandler({
                 region: ticketData.region,
                 stream: ticketData.stream,
             };
+            usageReference = ticketData.usageReference;
 
             // Revalidate the stored URL immediately before opening the socket. Tickets
             // only contain URLs produced by target-policy and cannot be client supplied.
@@ -232,6 +248,7 @@ function createProxyHandler({
             }, upstreamResponse => {
                 if (response.writableEnded) {
                     clientGone = true;
+                    finalizeUsage('incomplete', 'CLIENT_DISCONNECTED', usageCapture?.finish());
                     logTerminal('warn', 'proxy_client_disconnected');
                     upstreamResponse.destroy();
                     return;
@@ -251,8 +268,25 @@ function createProxyHandler({
                     response.writeHead(statusCode, responseHeaders);
                 }
                 logStore?.server(statusCode >= 400 ? 'warn' : 'info', 'proxy_upstream_response', makeLogContext({ statusCode }));
+                const encoding = upstreamResponse.headers?.['content-encoding'];
+                const compressed = Boolean(encoding && String(encoding).toLowerCase() !== 'identity');
+                if (!compressed) {
+                    usageCapture = new UsageCapture({ stream: ticketData.stream });
+                    upstreamResponse.on('data', chunk => {
+                        try { usageCapture.write(chunk); } catch { /* Usage capture is observational. */ }
+                    });
+                }
+                upstreamResponse.once('end', () => {
+                    const usage = usageCapture?.finish() || null;
+                    if (statusCode >= 400) finalizeUsage('failed', `UPSTREAM_HTTP_${statusCode}`, usage);
+                    else if (usageCapture?.limitExceeded) finalizeUsage('incomplete', 'USAGE_CAPTURE_LIMIT', usage);
+                    else if (usage) finalizeUsage('complete', undefined, usage);
+                    else finalizeUsage('incomplete', compressed ? 'USAGE_COMPRESSED_RESPONSE'
+                        : usageCapture?.limitExceeded ? 'USAGE_CAPTURE_LIMIT' : 'USAGE_METADATA_MISSING');
+                });
                 upstreamResponse.on('error', error => {
                     failureHandled = true;
+                    finalizeUsage('incomplete', 'UPSTREAM_RESPONSE_STREAM_FAILED', usageCapture?.finish());
                     logTerminal('error', 'proxy_response_stream_failed', describeError(error));
                     response.destroy();
                 });
@@ -266,7 +300,7 @@ function createProxyHandler({
                 fail(new PluginError(504, 'VERTEX_UPSTREAM_TIMEOUT', 'The Vertex AI upstream request timed out.'));
             });
 
-            bodyStream = ticketData.source === 'makersuite'
+            bodyStream = ticketData.source === 'makersuite' && ticketData.tier === 'flex'
                 ? new FlexBodyTransform(maxBodyBytes) : new ByteLimitTransform(maxBodyBytes);
             bodyStream.on('error', fail);
             upstream.on('error', error => {
@@ -277,6 +311,7 @@ function createProxyHandler({
             request.once('aborted', () => {
                 if (clientGone) return;
                 clientGone = true;
+                finalizeUsage('incomplete', 'CLIENT_DISCONNECTED', usageCapture?.finish());
                 logTerminal('warn', 'proxy_client_disconnected');
                 upstream.destroy();
                 bodyStream.destroy();
@@ -287,6 +322,7 @@ function createProxyHandler({
             response.once('close', () => {
                 if (!response.writableEnded) {
                     clientGone = true;
+                    finalizeUsage('incomplete', 'CLIENT_DISCONNECTED', usageCapture?.finish());
                     logTerminal('warn', 'proxy_client_disconnected');
                     upstream.destroy();
                     bodyStream.destroy();

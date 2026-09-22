@@ -19,7 +19,7 @@ const {
 
 function validBody(overrides = {}) {
     return {
-        protocolVersion: 1,
+        protocolVersion: 2,
         chat_completion_source: 'vertexai',
         model: 'gemini-2.5-pro',
         stream: true,
@@ -33,7 +33,7 @@ function validBody(overrides = {}) {
 
 test('prepare protocol accepts a canonical Vertex Gemini request', () => {
     assert.deepEqual(validatePreparePayload(validBody()), {
-        protocolVersion: 1,
+        protocolVersion: 2,
         source: 'vertexai',
         model: 'gemini-2.5-pro',
         region: 'global',
@@ -43,14 +43,16 @@ test('prepare protocol accepts a canonical Vertex Gemini request', () => {
         paygoOnly: false,
         expressProjectId: undefined,
         secretId: undefined,
+        usageChatId: undefined,
+        usagePrice: null,
     });
 });
 
-test('prepare protocol fails closed on non-Gemini, regional premium tier, proxy fields, and native Standard', () => {
+test('prepare protocol fails closed on non-Gemini, regional premium tier, and proxy fields', () => {
     assert.throws(() => validatePreparePayload(validBody({ model: 'claude-sonnet-4' })), { code: 'INVALID_PREPARE_REQUEST' });
     assert.throws(() => validatePreparePayload(validBody({ vertexai_region: 'us-central1' })), { code: 'GLOBAL_REGION_REQUIRED' });
     assert.throws(() => validatePreparePayload(validBody({ reverse_proxy: 'https://example.test' })), { code: 'UPSTREAM_PROXY_UNSUPPORTED' });
-    assert.throws(() => validatePreparePayload(validBody({ tier: 'standard', paygoOnly: false })), { code: 'NATIVE_ROUTE_REQUIRED' });
+    assert.equal(validatePreparePayload(validBody({ tier: 'standard', paygoOnly: false })).tier, 'standard');
 });
 
 test('target policy allows only the exact region host, model endpoint, and stream query', () => {

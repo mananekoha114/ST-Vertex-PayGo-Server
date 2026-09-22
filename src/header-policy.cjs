@@ -17,7 +17,7 @@ const SERVER_TIMEOUT_HEADER = 'X-Server-Timeout';
 function buildPayGoHeaders({ tier, paygoOnly, source = 'vertexai' }) {
     if (!['standard', 'flex', 'priority'].includes(tier) || typeof paygoOnly !== 'boolean'
         || !['vertexai', 'makersuite'].includes(source)
-        || (source === 'makersuite' && (tier !== 'flex' || paygoOnly))) {
+        || (source === 'makersuite' && (!['standard', 'flex'].includes(tier) || paygoOnly))) {
         throw new PluginError(500, 'INVALID_HEADER_POLICY', 'The PayGo header policy received invalid state.');
     }
 

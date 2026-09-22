@@ -92,10 +92,61 @@ async function loadStRuntime({
             return googleModule.getGoogleApiConfig(request, model, endpoint);
         }
 
-        // The host's Vertex full mode helper always reads the active service
-        // account. Refuse an explicit selection rather than silently using it.
         if (request?.body?.api === 'vertexai') {
-            const error = new Error('Explicit secret selection is unsupported for Vertex AI authentication.');
+            const directories = request?.user?.directories;
+            const authMode = request.body.vertexai_auth_mode;
+            const region = request.body.vertexai_region;
+            const host = region === 'global' ? 'aiplatform.googleapis.com' : `${region}-aiplatform.googleapis.com`;
+            const baseUrl = `https://${host}/v1`;
+            if (!directories) {
+                const error = new Error('An authenticated user is required for explicit secret selection.');
+                error.code = 'EXPLICIT_SECRET_UNAVAILABLE';
+                throw error;
+            }
+            if (authMode === 'express') {
+                const apiKey = secretsModule.readSecret(directories, secretsModule.SECRET_KEYS.VERTEXAI, secretId);
+                if (typeof apiKey !== 'string' || !apiKey) {
+                    const error = new Error('The requested Vertex AI Express secret was not found.');
+                    error.code = 'EXPLICIT_SECRET_NOT_FOUND';
+                    throw error;
+                }
+                const projectId = request.body.vertexai_express_project_id;
+                const pathPrefix = projectId ? `/projects/${projectId}/locations/${region}` : '';
+                return {
+                    url: `${baseUrl}${pathPrefix}/publishers/google/models/${model}:${endpoint}`,
+                    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
+                };
+            }
+            if (authMode === 'full') {
+                const requiredHelpers = ['generateJWTToken', 'getAccessToken', 'getProjectIdFromServiceAccount'];
+                if (requiredHelpers.some(name => typeof googleModule[name] !== 'function')) {
+                    const error = new Error('This host cannot authenticate an explicitly selected Vertex AI service account.');
+                    error.code = 'EXPLICIT_SECRET_UNSUPPORTED';
+                    throw error;
+                }
+                const serialized = secretsModule.readSecret(directories, secretsModule.SECRET_KEYS.VERTEXAI_SERVICE_ACCOUNT, secretId);
+                if (typeof serialized !== 'string' || !serialized) {
+                    const error = new Error('The requested Vertex AI service account was not found.');
+                    error.code = 'EXPLICIT_SECRET_NOT_FOUND';
+                    throw error;
+                }
+                try {
+                    const serviceAccount = JSON.parse(serialized);
+                    const projectId = googleModule.getProjectIdFromServiceAccount(serviceAccount);
+                    const jwtToken = await googleModule.generateJWTToken(serviceAccount);
+                    const accessToken = await googleModule.getAccessToken(jwtToken);
+                    if (typeof accessToken !== 'string' || !accessToken) throw new Error('Missing access token');
+                    return {
+                        url: `${baseUrl}/projects/${projectId}/locations/${region}/publishers/google/models/${model}:${endpoint}`,
+                        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${accessToken}` },
+                    };
+                } catch (cause) {
+                    const error = new Error('The selected Vertex AI service account could not be authenticated.', { cause });
+                    error.code = 'EXPLICIT_SECRET_UNAVAILABLE';
+                    throw error;
+                }
+            }
+            const error = new Error('Explicit secret selection is unsupported for this Vertex AI authentication mode.');
             error.code = 'EXPLICIT_SECRET_UNSUPPORTED';
             throw error;
         }

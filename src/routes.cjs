@@ -16,6 +16,7 @@ const {
 } = require('./protocol.cjs');
 const { createClientLogHandler, createReadLogsHandler } = require('./log-routes.cjs');
 const { createPrepareHandler } = require('./prepare-route.cjs');
+const { createUsageHandler } = require('./usage-route.cjs');
 
 function registerRoutes(router, dependencies) {
     router.get('/health', (request, response) => {
@@ -35,10 +36,12 @@ function registerRoutes(router, dependencies) {
             capabilities: {
                 logs: isAdmin,
                 clientLogging: isAdmin,
+                usage: true,
             },
         });
     });
     router.get('/logs', createReadLogsHandler(dependencies));
+    router.get('/usage', createUsageHandler(dependencies));
     router.post('/logs/client', createClientLogHandler(dependencies));
     router.post('/prepare', createPrepareHandler(dependencies));
     router.use('/rejected', (_request, response) => response.status(503).json({

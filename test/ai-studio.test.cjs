@@ -17,14 +17,15 @@ const { validatePreparePayload } = require('../src/protocol.cjs');
 const { prepareGoogleTarget } = require('../src/target-policy.cjs');
 
 const model = 'gemini-2.5-pro';
-const prepareBody = overrides => ({ protocolVersion: 1, chat_completion_source: 'makersuite', model, stream: true, tier: 'flex', paygoOnly: false, ...overrides });
+const prepareBody = overrides => ({ protocolVersion: 2, chat_completion_source: 'makersuite', model, stream: true, tier: 'flex', paygoOnly: false, ...overrides });
 
 test('AI Studio protocol accepts only Flex, independently of Vertex configuration', () => {
     const config = validatePreparePayload(prepareBody());
     assert.equal(config.source, 'makersuite');
     assert.equal(config.region, undefined);
     assert.equal(config.authMode, undefined);
-    for (const overrides of [{ tier: 'priority' }, { paygoOnly: true }, { tier: 'standard' }, { model: 'gemma-3' }, { chat_completion_source: 'custom' }, { reverse_proxy: 'https://bad.invalid' }]) {
+    assert.equal(validatePreparePayload(prepareBody({ tier: 'standard' })).tier, 'standard');
+    for (const overrides of [{ tier: 'priority' }, { paygoOnly: true }, { model: 'gemma-3' }, { chat_completion_source: 'custom' }, { reverse_proxy: 'https://bad.invalid' }]) {
         assert.throws(() => validatePreparePayload(prepareBody(overrides)));
     }
     for (const url of [
@@ -76,7 +77,7 @@ async function harness({ stream = true, statusCode = 200, maxBodyBytes } = {}) {
         calls, logs, ticketStore,
         async issue() {
             const response = { statusCode: 200, set() {}, status(code) { this.statusCode = code; return this; }, json(body) { this.body = body; } };
-            await prepare({ body: prepareBody({ stream }), user: { directories: {} } }, response);
+            await prepare({ body: prepareBody({ stream }), user: { directories: { root: 'test-user' } } }, response);
             assert.equal(response.statusCode, 200);
             assert.doesNotMatch(JSON.stringify(response.body), /real-google-key|generativelanguage/u);
             const { proxyUrl, proxySecret } = response.body;
