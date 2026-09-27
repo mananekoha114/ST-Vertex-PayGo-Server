@@ -9,6 +9,7 @@
 'use strict';
 
 const { createLoopbackTransport } = require('./src/loopback-server.cjs');
+const { createOpenAIBridge } = require('./src/openai-bridge.cjs');
 const { LogStore, describeError } = require('./src/log-store.cjs');
 const { PLUGIN_ID } = require('./src/protocol.cjs');
 const { registerRoutes } = require('./src/routes.cjs');
@@ -31,6 +32,7 @@ async function init(router) {
     logStore.server('info', 'plugin_initializing');
     let ticketStore;
     let loopbackTransport;
+    let openaiBridge;
     const usageStore = new UsageStore();
     try {
         const stRuntime = await loadStRuntime();
@@ -39,10 +41,12 @@ async function init(router) {
             hostVersion: stRuntime.stVersion,
         });
         ticketStore = new TicketStore();
-        loopbackTransport = createLoopbackTransport({ ticketStore, logStore, usageStore });
+        openaiBridge = createOpenAIBridge({ stRuntime });
+        loopbackTransport = createLoopbackTransport({ ticketStore, logStore, usageStore, openaiBridge });
         await loopbackTransport.start();
-        registerRoutes(router, { stRuntime, ticketStore, loopbackTransport, logStore, usageStore });
-        activeState = { ticketStore, loopbackTransport, logStore, usageStore };
+        openaiBridge.setBaseUrl(loopbackTransport.baseUrl);
+        registerRoutes(router, { stRuntime, ticketStore, loopbackTransport, logStore, usageStore, openaiBridge });
+        activeState = { ticketStore, loopbackTransport, logStore, usageStore, openaiBridge };
         logStore.server('info', 'plugin_ready', {
             hostName: stRuntime.hostName,
             hostVersion: stRuntime.stVersion,
@@ -51,6 +55,7 @@ async function init(router) {
         logStore.server('error', 'plugin_initialization_failed', describeError(error));
         try {
             ticketStore?.close();
+            openaiBridge?.close();
             await loopbackTransport?.close();
         } catch (cleanupError) {
             logStore.server('error', 'plugin_initialization_cleanup_failed', describeError(cleanupError));
@@ -67,6 +72,7 @@ async function exit() {
     if (!state) return;
     state.logStore.server('info', 'plugin_stopping');
     state.ticketStore.close();
+    state.openaiBridge.close();
     try {
         await state.loopbackTransport.close();
         state.logStore.server('info', 'plugin_stopped');

@@ -137,6 +137,37 @@ test('explicit Vertex Express and Full secrets use the selected host secret only
     ]);
 });
 
+test('bridge pins active IDs when exposed and snapshots credentials on older hosts', async () => {
+    let active = 'first';
+    const runtime = await loadStRuntime({
+        readFile: async () => JSON.stringify({ name: 'sillytavern', version: '1.18.0' }),
+        importModule: async specifier => specifier.endsWith('/secrets.js') ? {
+            SECRET_KEYS: { MAKERSUITE: 'api_key_makersuite', VERTEXAI_SERVICE_ACCOUNT: 'vertexai_service_account_json' },
+            readSecretState: () => ({ api_key_makersuite: [{ id: active, active: true }] }),
+            readSecret: (_directories, _key, id) => id ? `credential-${id}` : `credential-${active}`,
+        } : { getGoogleApiConfig: async () => { throw new Error('Native API must not be called'); } },
+    });
+    const request = { user: { directories: { root: 'alice' } } };
+    const selected = runtime.resolveOpenAIConnection(request, { source: 'makersuite', model: 'gemini-2.5-flash' });
+    assert.equal(selected.connection.secretId, 'first');
+    active = 'second';
+    assert.equal((await runtime.getOpenAIConfig(request, selected.connection)).headers.Authorization, 'Bearer credential-first');
+    assert.equal(selected.credentialSnapshot, undefined);
+
+    const oldRuntime = await loadStRuntime({
+        readFile: async () => JSON.stringify({ name: 'sillytavern', version: '1.18.0' }),
+        importModule: async specifier => specifier.endsWith('/secrets.js') ? {
+            SECRET_KEYS: { MAKERSUITE: 'api_key_makersuite' },
+            readSecretState: () => ({ api_key_makersuite: true }),
+            readSecret: () => `credential-${active}`,
+        } : { getGoogleApiConfig: async () => { throw new Error('Native API must not be called'); } },
+    });
+    const snapshot = oldRuntime.resolveOpenAIConnection(request, { source: 'makersuite', model: 'gemini-2.5-flash' });
+    assert.equal((await oldRuntime.getOpenAIConfig(request, snapshot.connection, true, snapshot.credentialSnapshot)).headers.Authorization, 'Bearer credential-second');
+    active = 'third';
+    await assert.rejects(oldRuntime.getOpenAIConfig(request, snapshot.connection, true, snapshot.credentialSnapshot), { code: 'GOOGLE_CONNECTION_CHANGED' });
+});
+
 test('route registration exposes handshake, prepare, and fail-closed sink', () => {
     const routes = { get: [], post: [], use: [] };
     const logEvents = [];
@@ -168,7 +199,7 @@ test('route registration exposes handshake, prepare, and fail-closed sink', () =
     assert.equal(response.body.transport, 'loopback-http');
     assert.equal(response.body.pluginVersion, '0.4.0');
     assert.equal(response.body.sillyTavern.compatibleRange, '>=1.16.0');
-    assert.deepEqual(response.body.capabilities, { logs: true, clientLogging: true, usage: true });
+    assert.deepEqual(response.body.capabilities, { logs: true, clientLogging: true, usage: true, openaiBridge: false });
     assert.equal(Object.hasOwn(response.body, 'port'), false);
     assert.deepEqual(logEvents, []);
 
@@ -181,5 +212,18 @@ test('route registration exposes handshake, prepare, and fail-closed sink', () =
     assert.equal(nonAdminResponse.body.capabilities.logs, false);
     assert.equal(nonAdminResponse.body.capabilities.clientLogging, false);
     assert.equal(nonAdminResponse.body.capabilities.usage, true);
+    assert.equal(nonAdminResponse.body.capabilities.openaiBridge, false);
     assert.deepEqual(logEvents, []);
+});
+
+test('health advertises the bridge only when its management routes are installed', () => {
+    const handlers = new Map();
+    const router = { get(path, handler) { handlers.set(`GET ${path}`, handler); }, post(path, handler) { handlers.set(`POST ${path}`, handler); }, use() {} };
+    const openaiBridge = { get() {}, update() {} };
+    registerRoutes(router, { stRuntime: { stVersion: '1.18.0' }, openaiBridge });
+    assert.equal(typeof handlers.get('GET /openai-bridge'), 'function');
+    assert.equal(typeof handlers.get('POST /openai-bridge'), 'function');
+    const response = { set() { return this; }, json(value) { this.body = value; return this; } };
+    handlers.get('GET /health')({ user: {} }, response);
+    assert.equal(response.body.capabilities.openaiBridge, true);
 });

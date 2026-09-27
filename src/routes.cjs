@@ -37,6 +37,7 @@ function registerRoutes(router, dependencies) {
                 logs: isAdmin,
                 clientLogging: isAdmin,
                 usage: true,
+                openaiBridge: Boolean(dependencies.openaiBridge),
             },
         });
     });
@@ -44,6 +45,10 @@ function registerRoutes(router, dependencies) {
     router.get('/usage', createUsageHandler(dependencies));
     router.post('/logs/client', createClientLogHandler(dependencies));
     router.post('/prepare', createPrepareHandler(dependencies));
+    if (dependencies.openaiBridge) {
+        router.get('/openai-bridge', (request, response) => dependencies.openaiBridge.get(request, response));
+        router.post('/openai-bridge', (request, response) => dependencies.openaiBridge.update(request, response));
+    }
     router.use('/rejected', (_request, response) => response.status(503).json({
         error: true,
         code: 'PAYGO_REQUEST_BLOCKED',

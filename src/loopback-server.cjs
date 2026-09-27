@@ -13,7 +13,7 @@ const { PluginError } = require('./errors.cjs');
 const { describeError } = require('./log-store.cjs');
 const { createProxyHandler } = require('./proxy-handler.cjs');
 
-function createLoopbackTransport({ ticketStore, logStore, usageStore, upstreamRequest, maxBodyBytes, upstreamTimeoutMs } = {}) {
+function createLoopbackTransport({ ticketStore, logStore, usageStore, upstreamRequest, maxBodyBytes, upstreamTimeoutMs, openaiBridge } = {}) {
     const proxyHandler = createProxyHandler({ ticketStore, logStore, usageStore, upstreamRequest, maxBodyBytes, upstreamTimeoutMs });
     let server;
     let baseUrl;
@@ -25,7 +25,7 @@ function createLoopbackTransport({ ticketStore, logStore, usageStore, upstreamRe
             try {
                 server = http.createServer((request, response) => {
                     response.setHeader('Cache-Control', 'no-store');
-                    proxyHandler(request, response);
+                    if (!openaiBridge?.route(request, response)) proxyHandler(request, response);
                 });
                 server.requestTimeout = 0;
                 server.headersTimeout = 60_000;

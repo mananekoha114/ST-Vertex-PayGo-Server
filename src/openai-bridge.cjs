@@ -1,0 +1,211 @@
+/*
+ * Copyright (c) 2026 Mana Nekoha
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
+
+'use strict';
+
+const { randomBytes, createHash } = require('node:crypto');
+const https = require('node:https');
+const { PluginError, sendExpressError } = require('./errors.cjs');
+
+const MAX_BODY = 16 * 1024 * 1024;
+const FORBIDDEN = /^(?:reverse_proxy|custom_url|proxy_password|apiKey|chat_completion_source|secret_id|secretId|authorization|headers|url|base_url)$/iu;
+const PASS_HEADERS = ['content-type', 'content-encoding', 'retry-after', 'x-request-id'];
+const modelPattern = /^(?:google\/)?gemini-[a-z0-9][a-z0-9._-]*$/u;
+
+function error(response, status, code, message) {
+    if (response.headersSent || response.writableEnded) return response.destroy();
+    response.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+    response.end(JSON.stringify({ error: { message, type: status < 500 ? 'invalid_request_error' : 'server_error', code } }));
+}
+
+function rejectEarly(request, response, status, code, message) {
+    response.shouldKeepAlive = false;
+    response.setHeader('Connection', 'close');
+    error(response, status, code, message);
+    request.resume();
+}
+
+function validateConnection(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new PluginError(400, 'INVALID_CONNECTION', 'A Google connection is required.');
+    if (Object.keys(value).some(key => !['source', 'model', 'authMode', 'region', 'secretId'].includes(key))) throw new PluginError(400, 'INVALID_CONNECTION', 'The connection has unsupported fields.');
+    const { source, model, authMode, region, secretId } = value;
+    if (!['makersuite', 'vertexai'].includes(source) || typeof model !== 'string' || !modelPattern.test(model)) throw new PluginError(400, 'INVALID_CONNECTION', 'The connection source or model is invalid.');
+    if (secretId !== undefined && (typeof secretId !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/u.test(secretId))) throw new PluginError(400, 'INVALID_CONNECTION', 'The secret ID is invalid.');
+    if (source === 'vertexai') {
+        if (authMode !== 'full' || typeof region !== 'string' || !/^(?:global|[a-z0-9][a-z0-9-]{0,62})$/u.test(region)) throw new PluginError(400, 'INVALID_CONNECTION', 'Vertex AI requires full authentication and a valid region.');
+    } else if (authMode !== undefined || region !== undefined) throw new PluginError(400, 'INVALID_CONNECTION', 'AI Studio does not accept Vertex fields.');
+    return Object.freeze({ source, model, ...(source === 'vertexai' ? { authMode, region } : {}), ...(secretId ? { secretId } : {}) });
+}
+
+function userId(request) {
+    const root = request?.user?.directories?.root;
+    if (typeof root !== 'string' || !root) throw new PluginError(401, 'AUTHENTICATED_USER_REQUIRED', 'An authenticated user is required.');
+    return createHash('sha256').update(root).digest('hex');
+}
+
+function createOpenAIBridge({ stRuntime, upstreamRequest = https.request, maxBodyBytes = MAX_BODY, timeoutMs = 180_000, maxGlobal = 16, maxPerUser = 4 } = {}) {
+    const states = new Map();
+    const keys = new Map();
+    const active = new Set();
+    const revisions = new Map();
+    let closed = false;
+    let baseUrl = null;
+
+    function view(state) {
+        return { ok: true, enabled: Boolean(state), baseUrl: state ? `${baseUrl}/openai/v1` : null, apiKey: state?.key ?? null, model: 'st-current', connection: state?.connection ?? null };
+    }
+    function revoke(state) {
+        if (!state) return;
+        keys.delete(state.key);
+        for (const operation of [...active]) if (operation.state === state) operation.cancel();
+    }
+    function route(request, response) {
+        if (!request.url?.startsWith('/openai/')) return false;
+        response.setHeader('Cache-Control', 'no-store');
+        response.shouldKeepAlive = false;
+        response.setHeader('Connection', 'close');
+        if (closed) { rejectEarly(request, response, 503, 'BRIDGE_CLOSED', 'The bridge is closed.'); return true; }
+        const path = request.url.split('?')[0];
+        if (!['/openai/v1/models', '/openai/v1/chat/completions'].includes(path) || request.url.includes('?')) { rejectEarly(request, response, 404, 'NOT_FOUND', 'The endpoint was not found.'); return true; }
+        const match = /^Bearer ([A-Za-z0-9_-]+)$/u.exec(request.headers.authorization || '');
+        const state = match && keys.get(match[1]);
+        if (!state) { rejectEarly(request, response, 401, 'INVALID_API_KEY', 'The bridge API key is invalid.'); return true; }
+        if (path.endsWith('/models')) {
+            if (request.method !== 'GET') rejectEarly(request, response, 405, 'METHOD_NOT_ALLOWED', 'GET is required.');
+            else { response.setHeader('Content-Type', 'application/json'); response.end(JSON.stringify({ object: 'list', data: [...new Set(['st-current', state.connection.model])].map(id => ({ id, object: 'model', owned_by: 'google' })) })); }
+            return true;
+        }
+        if (request.method !== 'POST') { rejectEarly(request, response, 405, 'METHOD_NOT_ALLOWED', 'POST is required.'); return true; }
+        if (!/^application\/json(?:\s*;|$)/iu.test(request.headers['content-type'] || '')) { rejectEarly(request, response, 415, 'JSON_REQUIRED', 'A JSON body is required.'); return true; }
+        if (Number(request.headers['content-length']) > maxBodyBytes) { rejectEarly(request, response, 413, 'REQUEST_BODY_TOO_LARGE', 'The request body is too large.'); return true; }
+        if (active.size >= maxGlobal || [...active].filter(item => item.state === state).length >= maxPerUser) { rejectEarly(request, response, 429, 'BRIDGE_BUSY', 'The bridge concurrency limit was reached.'); return true; }
+        const operation = { state, terminal: false, upstream: null, timer: null, rejectBody: null, cleanupBody: null };
+        active.add(operation);
+        const done = () => {
+            if (operation.terminal) return false;
+            operation.terminal = true;
+            clearTimeout(operation.timer);
+            operation.cleanupBody?.();
+            active.delete(operation);
+            return true;
+        };
+        const cancel = () => {
+            const rejectBody = operation.rejectBody;
+            if (!done()) return;
+            rejectBody?.(new Error('Cancelled'));
+            operation.upstream?.destroy();
+            response.destroy();
+        };
+        const fail = (status, code, message) => {
+            const rejectBody = operation.rejectBody;
+            if (!done()) return;
+            rejectBody?.(new Error('Terminated'));
+            operation.upstream?.destroy();
+            response.shouldKeepAlive = false;
+            error(response, status, code, message);
+            request.resume();
+        };
+        operation.cancel = cancel;
+        operation.timer = setTimeout(() => fail(504, 'GOOGLE_TIMEOUT', 'The bridge request timed out.'), timeoutMs);
+        response.once('close', () => { if (!response.writableEnded) cancel(); else { done(); operation.upstream?.destroy(); } });
+        request.once('aborted', cancel);
+        (async () => {
+            try {
+                const chunks = []; let bytes = 0;
+                await new Promise((resolve, reject) => {
+                    const cleanup = () => {
+                        request.removeListener('data', onData);
+                        request.removeListener('end', onEnd);
+                        request.removeListener('error', onError);
+                        operation.cleanupBody = null;
+                        operation.rejectBody = null;
+                    };
+                    const onData = chunk => {
+                        bytes += chunk.length;
+                        if (bytes > maxBodyBytes) { cleanup(); reject(new PluginError(413, 'REQUEST_BODY_TOO_LARGE', 'The request body is too large.')); return; }
+                        chunks.push(chunk);
+                    };
+                    const onEnd = () => { cleanup(); resolve(); };
+                    const onError = cause => { cleanup(); reject(cause); };
+                    operation.cleanupBody = cleanup;
+                    operation.rejectBody = reject;
+                    request.on('data', onData);
+                    request.once('end', onEnd);
+                    request.once('error', onError);
+                });
+                if (operation.terminal) return;
+                let payload;
+                try { payload = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { throw new PluginError(400, 'INVALID_JSON', 'The request body is not valid JSON.'); }
+                if (!payload || typeof payload !== 'object' || Array.isArray(payload) || !Array.isArray(payload.messages) || payload.messages.length === 0 || payload.messages.some(message => !message || typeof message !== 'object' || typeof message.role !== 'string')) throw new PluginError(400, 'INVALID_MESSAGES', 'A nonempty messages array is required.');
+                if (Object.keys(payload).some(key => FORBIDDEN.test(key))) throw new PluginError(400, 'FORBIDDEN_FIELD', 'The request contains an internal routing or credential field.');
+                const model = payload.model ?? 'st-current';
+                if (model !== 'st-current' && (typeof model !== 'string' || !modelPattern.test(model))) throw new PluginError(400, 'INVALID_MODEL', 'The model is invalid.');
+                payload.model = model === 'st-current' ? state.connection.model : model;
+                if (state.connection.source === 'vertexai' && !payload.model.startsWith('google/')) payload.model = `google/${payload.model}`;
+                if (state.connection.source === 'makersuite' && payload.model.startsWith('google/')) payload.model = payload.model.slice(7);
+                const config = await stRuntime.getOpenAIConfig({ user: { directories: state.directories } }, state.connection, true, state.credentialSnapshot);
+                if (operation.terminal || keys.get(state.key) !== state || response.writableEnded) return;
+                const target = new URL(config.target);
+                const vertexHost = state.connection.region === 'global' ? 'aiplatform.googleapis.com' : `${state.connection.region}-aiplatform.googleapis.com`;
+                if (target.protocol !== 'https:' || target.username || target.password || target.port || target.search || target.hash || (state.connection.source === 'makersuite' ? target.hostname !== 'generativelanguage.googleapis.com' || target.pathname !== '/v1beta/openai/chat/completions' : target.hostname !== vertexHost || !new RegExp(`^/v1/projects/[a-z][a-z0-9-]{4,62}/locations/${state.connection.region}/endpoints/openapi/chat/completions$`, 'u').test(target.pathname))) throw new PluginError(500, 'INVALID_GOOGLE_TARGET', 'The Google target is invalid.');
+                const body = Buffer.from(JSON.stringify(payload));
+                const upstream = upstreamRequest(target, { method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': body.length, 'Accept-Encoding': 'identity', Authorization: config.headers.Authorization } }, upstreamResponse => {
+                    if (operation.terminal || response.writableEnded || response.destroyed) { upstreamResponse.destroy(); return; }
+                    const status = upstreamResponse.statusCode || 502;
+                    if (status >= 300 && status < 400) { upstreamResponse.destroy(); fail(502, 'GOOGLE_REDIRECT_REJECTED', 'Google returned a redirect.'); return; }
+                    const headers = { 'Cache-Control': 'no-store' };
+                    for (const name of PASS_HEADERS) if (upstreamResponse.headers?.[name]) headers[name] = upstreamResponse.headers[name];
+                    response.writeHead(status, headers);
+                    upstreamResponse.once('error', () => response.destroy());
+                    upstreamResponse.pipe(response);
+                });
+                operation.upstream = upstream;
+                upstream.once('error', () => fail(502, 'GOOGLE_UPSTREAM_FAILED', 'The Google connection failed.'));
+                upstream.end(body);
+            } catch (cause) {
+                fail(cause.status || 500, cause.code || 'BRIDGE_FAILED', cause.status ? cause.message : 'The bridge request failed.');
+            }
+        })();
+        return true;
+    }
+    return {
+        setBaseUrl(value) { baseUrl = value; },
+        route,
+        get(request, response) { try { response.set?.('Cache-Control', 'no-store'); return response.json(view(states.get(userId(request)))); } catch (cause) { return sendExpressError(response, cause); } },
+        async update(request, response) {
+            try {
+                response.set?.('Cache-Control', 'no-store');
+                const id = userId(request);
+                const revision = (revisions.get(id) || 0) + 1;
+                revisions.set(id, revision);
+                const body = request.body;
+                if (!body || typeof body !== 'object' || Array.isArray(body) || typeof body.enabled !== 'boolean' || Object.keys(body).some(key => !['enabled', 'connection', 'rotateKey'].includes(key)) || (body.rotateKey !== undefined && typeof body.rotateKey !== 'boolean')) throw new PluginError(400, 'INVALID_BRIDGE_CONFIG', 'The bridge configuration is invalid.');
+                const previous = states.get(id);
+                if (!body.enabled) { revoke(previous); states.delete(id); return response.json(view(null)); }
+                let connection = body.connection === undefined ? previous?.connection : validateConnection(body.connection);
+                if (!connection) throw new PluginError(400, 'INVALID_CONNECTION', 'A Google connection is required.');
+                const directories = { ...request.user.directories };
+                const resolved = body.connection === undefined && previous
+                    ? { connection, credentialSnapshot: previous.credentialSnapshot }
+                    : stRuntime.resolveOpenAIConnection({ user: { directories } }, connection);
+                connection = resolved.connection;
+                await stRuntime.getOpenAIConfig({ user: { directories } }, connection, false, resolved.credentialSnapshot);
+                if (closed || revisions.get(id) !== revision) throw new PluginError(409, 'BRIDGE_UPDATE_SUPERSEDED', 'A newer bridge update replaced this request.');
+                const key = previous && !body.rotateKey ? previous.key : randomBytes(32).toString('base64url');
+                if (previous) revoke(previous);
+                const state = { key, connection, directories, credentialSnapshot: resolved.credentialSnapshot };
+                states.set(id, state); keys.set(key, state);
+                response.set?.('Cache-Control', 'no-store');
+                return response.json(view(state));
+            } catch (cause) { return sendExpressError(response, cause); }
+        },
+        close() { closed = true; for (const state of states.values()) revoke(state); states.clear(); keys.clear(); },
+    };
+}
+
+module.exports = { createOpenAIBridge, validateConnection };

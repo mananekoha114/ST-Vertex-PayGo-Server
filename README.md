@@ -9,6 +9,57 @@
 
 ---
 
+## 开发分支：Google OpenAI 兼容桥接
+
+`feat/google-openai-bridge` 新增可选的本机 OpenAI 兼容入口，尚未发布。默认关闭，需配套同分支前端管理；仅支持 **SillyTavern / Luker，TauriTavern 不可用**。
+
+桥接只将 Chat Completions 请求转发到以下 Google 官方端点：
+
+- AI Studio：`https://generativelanguage.googleapis.com/v1beta/openai/chat/completions`，使用宿主保存的 Gemini API key。
+- Vertex AI：`https://{region}-aiplatform.googleapis.com/v1/projects/{project}/locations/{region}/endpoints/openapi/chat/completions`；`global` 使用 `aiplatform.googleapis.com`，由宿主保存的服务账号换取 OAuth access token。
+
+Vertex Express/API key 认证暂不支持。桥接不调用原生生成接口，不跟随 HTTP 重定向，不自动重试、换账号或回退其他协议。官方端点的使用不构成账号安全、免封或合规保证。
+
+### 管理与调用
+
+已登录用户通过宿主路由管理自己的桥接：
+
+| 方法 | 路径 | 用途 |
+| --- | --- | --- |
+| GET | `/api/plugins/vertex-paygo/openai-bridge` | 读取自己的状态、地址和桥接 key |
+| POST | `/api/plugins/vertex-paygo/openai-bridge` | 启用、关闭、手动更新固定连接或轮换 key |
+
+POST 请求示例（配置中没有 Google 凭据明文）：
+
+```json
+{
+  "enabled": true,
+  "connection": {
+    "source": "vertexai",
+    "model": "gemini-2.5-pro",
+    "authMode": "full",
+    "region": "global"
+  }
+}
+```
+
+`secretId` 可选择宿主已保存的凭据。未指定时在启用阶段绑定当前凭据，不随主界面后续换号。`{"enabled": false}` 关闭并撤销访问；`{"enabled": true, "rotateKey": true}` 沿用已绑定连接并轮换桥接 key。
+
+启用后，返回 Base URL `http://127.0.0.1:<动态端口>/openai/v1`。调用方使用独立桥接 key 作为 Bearer 凭据，调用 `GET /models` 或 `POST /chat/completions`。模型别名 `st-current` 表示**桥接绑定模型**，并非实时主聊天模型。调用者也可显式选择合法的 `gemini-*` 模型；Vertex 会添加 `google/` 前缀。
+
+### 生命周期与隔离
+
+- 复用绑定 `127.0.0.1` 的回环监听器，不提供外网监听和浏览器跨域调用。第三方插件应通过 ST/Luker 后端请求该地址。
+- 每个宿主用户使用独立连接和随机桥接 key。请求只使用该用户绑定的 Google 凭据；不转发调用方的认证头、Cookie 或自定义上游地址。
+- 配置和桥接 key 仅在内存中存活；宿主重启后功能关闭，地址和 key 需要重新复制。关闭、手动更新连接或轮换 key 都会取消对应未完成请求；关闭和轮换还会撤销旧 key。
+- 显式选择的凭据不存在时拒绝，不回退其他账号。宿主不能提供活动凭据 ID 时，使用私有凭据快照；检测到活动凭据改变或删除后停止请求，需手动更新连接。
+- 请求体上限 16 MiB，每用户最多 4 个、全局最多 16 个并发请求；从接收请求起总时限为 180 秒，包含流式输出。下游取消会终止上游生成传输。Google JSON/SSE 响应内容和错误状态直接返回，不记录提示词、模型输出或凭据。
+- 不继承现有 PayGo 层级设置，不建立主聊天用量账本记录。调用插件提供的官方兼容参数由上游判断是否支持。
+
+参考：[AI Studio 官方兼容协议](https://ai.google.dev/gemini-api/docs/openai)、[Vertex AI 官方兼容协议](https://docs.cloud.google.com/vertex-ai/generative-ai/docs/start/openai)。
+
+---
+
 ## 为什么需要此后端插件？
 
 SillyTavern 与 Luker 原生请求管道并未对外暴露 Google 专有的 PayGo 调度层级标头与请求体参数。为了在**不侵入式篡改宿主源码、不破坏原生密钥安全存储机制**的前提下实现层级调度，必须采用前后端分离协作架构：

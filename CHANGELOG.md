@@ -1,5 +1,12 @@
 # 更新日志
 
+## 未发布 · Google OpenAI 兼容桥接
+
+- 为 ST/Luker 增加默认关闭、按用户隔离的本机 `/openai/v1` 入口及已登录用户管理接口。
+- 仅转发 Google AI Studio 与 Vertex AI 官方 OpenAI 兼容端点；支持 AI Studio key 和 Vertex 服务账号 OAuth，不支持 Express、不执行原生协议转换或失败回退。
+- 支持固定连接、`st-current` 别名、JSON/SSE 透传、访问 key 轮换和撤销；重启后关闭。
+- 增加请求体、并发、超时和取消保护；不转发调用方凭据，不将桥接调用记入主聊天费用账本。
+
 ## 2026-09-22 · 0.4.0 对话用量与 Standard 代理
 
 - 协议升级到 v2；Vertex AI 与 Google AI Studio 的 Gemini Standard 请求可经安全回环代理，且不注入 PayGo-only、Flex 或 Priority 参数。
