@@ -199,7 +199,7 @@ test('route registration exposes handshake, prepare, and fail-closed sink', () =
     assert.equal(response.body.transport, 'loopback-http');
     assert.equal(response.body.pluginVersion, '0.4.0');
     assert.equal(response.body.sillyTavern.compatibleRange, '>=1.16.0');
-    assert.deepEqual(response.body.capabilities, { logs: true, clientLogging: true, usage: true, openaiBridge: false, openaiBridgeDebug: false });
+    assert.deepEqual(response.body.capabilities, { logs: true, clientLogging: true, usage: true, openaiBridge: false, openaiBridgeDebug: false, openaiBridgeLogs: false });
     assert.equal(Object.hasOwn(response.body, 'port'), false);
     assert.deepEqual(logEvents, []);
 
@@ -227,4 +227,5 @@ test('health advertises the bridge only when its management routes are installed
     handlers.get('GET /health')({ user: {} }, response);
     assert.equal(response.body.capabilities.openaiBridge, true);
     assert.equal(response.body.capabilities.openaiBridgeDebug, true);
+    assert.equal(response.body.capabilities.openaiBridgeLogs, true);
 });

@@ -39,6 +39,7 @@ function registerRoutes(router, dependencies) {
                 usage: true,
                 openaiBridge: Boolean(dependencies.openaiBridge),
                 openaiBridgeDebug: Boolean(dependencies.openaiBridge),
+                openaiBridgeLogs: Boolean(dependencies.openaiBridge),
             },
         });
     });
@@ -49,6 +50,8 @@ function registerRoutes(router, dependencies) {
     if (dependencies.openaiBridge) {
         router.get('/openai-bridge', (request, response) => dependencies.openaiBridge.get(request, response));
         router.post('/openai-bridge', (request, response) => dependencies.openaiBridge.update(request, response));
+        router.get('/openai-bridge/logs', (request, response) => dependencies.openaiBridge.getLogs(request, response));
+        router.post('/openai-bridge/logs/clear', (request, response) => dependencies.openaiBridge.clearLogs(request, response));
     }
     router.use('/rejected', (_request, response) => response.status(503).json({
         error: true,
