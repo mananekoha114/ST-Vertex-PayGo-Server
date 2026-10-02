@@ -32,6 +32,10 @@ function fakeGoogle(calls, reply = {}) {
         const chunks = [];
         request.on('data', chunk => chunks.push(chunk));
         request.on('finish', () => {
+            if (options.method === 'GET') {
+                const response = new PassThrough(); response.statusCode = 200; response.headers = { 'content-type': 'application/json' };
+                callback(response); response.end('{"object":"list","data":[{"id":"gemini-2.5-flash"}]}'); return;
+            }
             calls.push({ target: String(target), options, body: JSON.parse(Buffer.concat(chunks).toString()) });
             const response = new PassThrough();
             response.statusCode = reply.status || 200;
@@ -58,11 +62,71 @@ async function setup(reply) {
     return { bridge, transport, calls };
 }
 
+test('local debug CORS requires an enabled per-user setting and bridge bearer key', async () => {
+    const { bridge, transport, calls } = await setup();
+    const url = `${transport.baseUrl}/openai/v1`;
+    const origin = 'http://localhost:8000';
+    const preflight = (value = origin, method = 'POST', headers = 'authorization, content-type, x-stainless-lang') => fetch(`${url}/chat/completions`, { method: 'OPTIONS', headers: { Origin: value, 'Access-Control-Request-Method': method, 'Access-Control-Request-Headers': headers, 'Access-Control-Request-Private-Network': 'true' } });
+    const configure = async (name, body) => { const result = managerResponse(); await bridge.update({ ...user(name), body }, result); assert.equal(result.code, 200); return result.body; };
+    const connection = { source: 'makersuite', model: 'gemini-2.5-flash' };
+    const get = (key, value = origin) => fetch(`${url}/models`, { headers: { Authorization: `Bearer ${key}`, Origin: value } });
+    try {
+        assert.equal((await preflight()).status, 403);
+        let alice = await configure('alice', { enabled: true, connection });
+        assert.equal(alice.debugLocalAccess, false);
+        assert.equal((await get(alice.apiKey)).status, 403);
+        alice = await configure('alice', { enabled: true, debugLocalAccess: true });
+        const bob = await configure('bob', { enabled: true, connection });
+        const allowed = await preflight();
+        assert.equal(allowed.status, 204);
+        assert.equal(allowed.headers.get('access-control-allow-origin'), origin);
+        assert.equal(allowed.headers.get('access-control-max-age'), '0');
+        assert.equal(allowed.headers.get('access-control-allow-private-network'), 'true');
+        assert.match(allowed.headers.get('access-control-allow-headers'), /x-stainless-lang/u);
+        assert.match(allowed.headers.get('vary'), /Access-Control-Request-Headers/u);
+        assert.equal((await preflight(origin, 'DELETE')).status, 403);
+        assert.equal((await preflight(origin, 'POST', 'authorization, bad header')).status, 403);
+        for (const value of ['null', 'file://localhost', 'https://example.com', 'http://localhost.evil', 'http://evil@localhost', 'http://localhost/', 'http://localhost:99999']) {
+            assert.equal((await preflight(value)).status, 403, value);
+            const rejected = await get(alice.apiKey, value);
+            assert.equal(rejected.status, 403, value);
+            assert.equal(rejected.headers.get('access-control-allow-origin'), null);
+        }
+        for (const value of [origin, 'https://127.0.0.1:443', 'http://[::1]:1234']) {
+            const result = await get(alice.apiKey, value);
+            assert.equal(result.status, 200);
+            assert.equal(result.headers.get('access-control-allow-origin'), value);
+        }
+        assert.equal((await get(bob.apiKey)).status, 403);
+        assert.equal((await fetch(`${url}/models`, { headers: { Origin: origin } })).status, 401);
+        const completion = await fetch(`${url}/chat/completions`, { method: 'POST', headers: { Authorization: `Bearer ${alice.apiKey}`, Origin: origin, 'Content-Type': 'application/json' }, body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }) });
+        assert.equal(completion.status, 200);
+        assert.equal(completion.headers.get('access-control-allow-origin'), origin);
+        assert.equal(calls.length, 1);
+        const retained = await configure('alice', { enabled: true });
+        assert.equal(retained.debugLocalAccess, true);
+        alice = await configure('alice', { enabled: true, debugLocalAccess: false });
+        assert.equal((await preflight()).status, 403);
+        assert.equal((await get(alice.apiKey)).status, 403);
+        assert.equal((await fetch(`${url}/models`, { headers: { Authorization: `Bearer ${alice.apiKey}` } })).status, 200);
+        alice = await configure('alice', { enabled: true, debugLocalAccess: true });
+        const rotated = await configure('alice', { enabled: true, rotateKey: true });
+        assert.equal((await get(alice.apiKey)).status, 401);
+        assert.equal((await get(rotated.apiKey)).status, 200);
+        const disabled = await configure('alice', { enabled: false });
+        assert.equal(disabled.debugLocalAccess, false);
+        assert.equal((await preflight()).status, 403);
+        assert.equal((await get(rotated.apiKey)).status, 401);
+        const invalid = managerResponse(); await bridge.update({ ...user('bob'), body: { enabled: true, debugLocalAccess: 'true' } }, invalid);
+        assert.equal(invalid.code, 400);
+    } finally { bridge.close(); await transport.close(); }
+});
+
 test('bridge starts disabled, isolates users, forwards OpenAI JSON and revokes rotated keys', async () => {
     const { bridge, transport, calls } = await setup();
     try {
         const initial = managerResponse(); bridge.get(user('alice'), initial);
-        assert.deepEqual(initial.body, { ok: true, enabled: false, baseUrl: null, apiKey: null, model: 'st-current', connection: null });
+        assert.deepEqual(initial.body, { ok: true, enabled: false, debugLocalAccess: false, baseUrl: null, apiKey: null, model: 'st-current', connection: null });
         const enabled = managerResponse();
         await bridge.update({ ...user('alice'), body: { enabled: true, connection: { source: 'makersuite', model: 'gemini-2.5-flash' } } }, enabled);
         assert.equal(enabled.body.enabled, true);

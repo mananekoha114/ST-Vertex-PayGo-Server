@@ -11,11 +11,22 @@
 const { randomBytes, createHash } = require('node:crypto');
 const https = require('node:https');
 const { PluginError, sendExpressError } = require('./errors.cjs');
+const { discoverModels, validatedTarget } = require('./openai-models.cjs');
 
 const MAX_BODY = 16 * 1024 * 1024;
 const FORBIDDEN = /^(?:reverse_proxy|custom_url|proxy_password|apiKey|chat_completion_source|secret_id|secretId|authorization|headers|url|base_url)$/iu;
 const PASS_HEADERS = ['content-type', 'content-encoding', 'retry-after', 'x-request-id'];
 const modelPattern = /^(?:google\/)?gemini-[a-z0-9][a-z0-9._-]*$/u;
+
+function localOrigin(value) {
+    // Require a serialized origin: URL parsing alone normalizes spoofed paths.
+    if (typeof value !== 'string' || !/^https?:\/\/(?:localhost|127\.0\.0\.1|\[::1\])(?::[0-9]{1,5})?$/u.test(value)) return false;
+    try { new URL(value); return true; } catch { return false; }
+}
+function cors(response, origin, preflight = false) {
+    response.setHeader('Access-Control-Allow-Origin', origin);
+    response.setHeader('Vary', preflight ? 'Origin, Access-Control-Request-Method, Access-Control-Request-Headers, Access-Control-Request-Private-Network' : 'Origin');
+}
 
 function error(response, status, code, message) {
     if (response.headersSent || response.writableEnded) return response.destroy();
@@ -57,7 +68,7 @@ function createOpenAIBridge({ stRuntime, upstreamRequest = https.request, maxBod
     let baseUrl = null;
 
     function view(state) {
-        return { ok: true, enabled: Boolean(state), baseUrl: state ? `${baseUrl}/openai/v1` : null, apiKey: state?.key ?? null, model: 'st-current', connection: state?.connection ?? null };
+        return { ok: true, enabled: Boolean(state), debugLocalAccess: Boolean(state?.debugLocalAccess), baseUrl: state ? `${baseUrl}/openai/v1` : null, apiKey: state?.key ?? null, model: 'st-current', connection: state?.connection ?? null };
     }
     function revoke(state) {
         if (!state) return;
@@ -72,16 +83,32 @@ function createOpenAIBridge({ stRuntime, upstreamRequest = https.request, maxBod
         if (closed) { rejectEarly(request, response, 503, 'BRIDGE_CLOSED', 'The bridge is closed.'); return true; }
         const path = request.url.split('?')[0];
         if (!['/openai/v1/models', '/openai/v1/chat/completions'].includes(path) || request.url.includes('?')) { rejectEarly(request, response, 404, 'NOT_FOUND', 'The endpoint was not found.'); return true; }
+        const origin = request.headers.origin;
+        if (request.method === 'OPTIONS') {
+            const method = request.headers['access-control-request-method'];
+            const headers = request.headers['access-control-request-headers'];
+            const headerNames = headers === undefined ? [] : String(headers).split(',').map(name => name.trim());
+            if (!localOrigin(origin) || ![...states.values()].some(item => item.debugLocalAccess) || method !== (path.endsWith('/models') ? 'GET' : 'POST') || headerNames.some(name => !/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/u.test(name)) || (request.headers['access-control-request-private-network'] !== undefined && request.headers['access-control-request-private-network'] !== 'true')) {
+                rejectEarly(request, response, 403, 'ORIGIN_NOT_ALLOWED', 'Local browser access is disabled or the preflight is invalid.'); return true;
+            }
+            cors(response, origin, true);
+            response.setHeader('Access-Control-Allow-Methods', method);
+            if (headerNames.length) response.setHeader('Access-Control-Allow-Headers', [...new Set(headerNames.map(name => name.toLowerCase()))].join(', '));
+            response.setHeader('Access-Control-Max-Age', '0');
+            if (request.headers['access-control-request-private-network'] === 'true') response.setHeader('Access-Control-Allow-Private-Network', 'true');
+            response.writeHead(204); response.end(); return true;
+        }
         const match = /^Bearer ([A-Za-z0-9_-]+)$/u.exec(request.headers.authorization || '');
         const state = match && keys.get(match[1]);
         if (!state) { rejectEarly(request, response, 401, 'INVALID_API_KEY', 'The bridge API key is invalid.'); return true; }
-        if (path.endsWith('/models')) {
-            if (request.method !== 'GET') rejectEarly(request, response, 405, 'METHOD_NOT_ALLOWED', 'GET is required.');
-            else { response.setHeader('Content-Type', 'application/json'); response.end(JSON.stringify({ object: 'list', data: [...new Set(['st-current', state.connection.model])].map(id => ({ id, object: 'model', owned_by: 'google' })) })); }
-            return true;
+        if (origin !== undefined) {
+            if (!state.debugLocalAccess || !localOrigin(origin)) { rejectEarly(request, response, 403, 'ORIGIN_NOT_ALLOWED', 'Local browser access is disabled or the origin is invalid.'); return true; }
+            cors(response, origin);
         }
-        if (request.method !== 'POST') { rejectEarly(request, response, 405, 'METHOD_NOT_ALLOWED', 'POST is required.'); return true; }
-        if (!/^application\/json(?:\s*;|$)/iu.test(request.headers['content-type'] || '')) { rejectEarly(request, response, 415, 'JSON_REQUIRED', 'A JSON body is required.'); return true; }
+        const modelsRequest = path.endsWith('/models');
+        const method = modelsRequest ? 'GET' : 'POST';
+        if (request.method !== method) { rejectEarly(request, response, 405, 'METHOD_NOT_ALLOWED', `${method} is required.`); return true; }
+        if (!modelsRequest && !/^application\/json(?:\s*;|$)/iu.test(request.headers['content-type'] || '')) { rejectEarly(request, response, 415, 'JSON_REQUIRED', 'A JSON body is required.'); return true; }
         if (Number(request.headers['content-length']) > maxBodyBytes) { rejectEarly(request, response, 413, 'REQUEST_BODY_TOO_LARGE', 'The request body is too large.'); return true; }
         if (active.size >= maxGlobal || [...active].filter(item => item.state === state).length >= maxPerUser) { rejectEarly(request, response, 429, 'BRIDGE_BUSY', 'The bridge concurrency limit was reached.'); return true; }
         const operation = { state, terminal: false, upstream: null, timer: null, rejectBody: null, cleanupBody: null };
@@ -116,6 +143,13 @@ function createOpenAIBridge({ stRuntime, upstreamRequest = https.request, maxBod
         request.once('aborted', cancel);
         (async () => {
             try {
+                if (modelsRequest) {
+                    const config = await stRuntime.getOpenAIConfig({ user: { directories: state.directories } }, state.connection, true, state.credentialSnapshot);
+                    if (operation.terminal || keys.get(state.key) !== state) return;
+                    const catalog = await discoverModels({ config, connection: state.connection, upstreamRequest, operation });
+                    if (operation.terminal || !catalog) return;
+                    done(); response.setHeader('Content-Type', 'application/json'); response.end(JSON.stringify(catalog)); return;
+                }
                 const chunks = []; let bytes = 0;
                 await new Promise((resolve, reject) => {
                     const cleanup = () => {
@@ -150,9 +184,7 @@ function createOpenAIBridge({ stRuntime, upstreamRequest = https.request, maxBod
                 if (state.connection.source === 'makersuite' && payload.model.startsWith('google/')) payload.model = payload.model.slice(7);
                 const config = await stRuntime.getOpenAIConfig({ user: { directories: state.directories } }, state.connection, true, state.credentialSnapshot);
                 if (operation.terminal || keys.get(state.key) !== state || response.writableEnded) return;
-                const target = new URL(config.target);
-                const vertexHost = state.connection.region === 'global' ? 'aiplatform.googleapis.com' : `${state.connection.region}-aiplatform.googleapis.com`;
-                if (target.protocol !== 'https:' || target.username || target.password || target.port || target.search || target.hash || (state.connection.source === 'makersuite' ? target.hostname !== 'generativelanguage.googleapis.com' || target.pathname !== '/v1beta/openai/chat/completions' : target.hostname !== vertexHost || !new RegExp(`^/v1/projects/[a-z][a-z0-9-]{4,62}/locations/${state.connection.region}/endpoints/openapi/chat/completions$`, 'u').test(target.pathname))) throw new PluginError(500, 'INVALID_GOOGLE_TARGET', 'The Google target is invalid.');
+                const target = validatedTarget(config, state.connection);
                 const body = Buffer.from(JSON.stringify(payload));
                 const upstream = upstreamRequest(target, { method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': body.length, 'Accept-Encoding': 'identity', Authorization: config.headers.Authorization } }, upstreamResponse => {
                     if (operation.terminal || response.writableEnded || response.destroyed) { upstreamResponse.destroy(); return; }
@@ -168,6 +200,7 @@ function createOpenAIBridge({ stRuntime, upstreamRequest = https.request, maxBod
                 upstream.once('error', () => fail(502, 'GOOGLE_UPSTREAM_FAILED', 'The Google connection failed.'));
                 upstream.end(body);
             } catch (cause) {
+                if (cause.retryAfter && !response.headersSent && !operation.terminal) response.setHeader('Retry-After', cause.retryAfter);
                 fail(cause.status || 500, cause.code || 'BRIDGE_FAILED', cause.status ? cause.message : 'The bridge request failed.');
             }
         })();
@@ -184,7 +217,7 @@ function createOpenAIBridge({ stRuntime, upstreamRequest = https.request, maxBod
                 const revision = (revisions.get(id) || 0) + 1;
                 revisions.set(id, revision);
                 const body = request.body;
-                if (!body || typeof body !== 'object' || Array.isArray(body) || typeof body.enabled !== 'boolean' || Object.keys(body).some(key => !['enabled', 'connection', 'rotateKey'].includes(key)) || (body.rotateKey !== undefined && typeof body.rotateKey !== 'boolean')) throw new PluginError(400, 'INVALID_BRIDGE_CONFIG', 'The bridge configuration is invalid.');
+                if (!body || typeof body !== 'object' || Array.isArray(body) || typeof body.enabled !== 'boolean' || Object.keys(body).some(key => !['enabled', 'connection', 'rotateKey', 'debugLocalAccess'].includes(key)) || (body.rotateKey !== undefined && typeof body.rotateKey !== 'boolean') || (body.debugLocalAccess !== undefined && typeof body.debugLocalAccess !== 'boolean')) throw new PluginError(400, 'INVALID_BRIDGE_CONFIG', 'The bridge configuration is invalid.');
                 const previous = states.get(id);
                 if (!body.enabled) { revoke(previous); states.delete(id); return response.json(view(null)); }
                 let connection = body.connection === undefined ? previous?.connection : validateConnection(body.connection);
@@ -198,7 +231,7 @@ function createOpenAIBridge({ stRuntime, upstreamRequest = https.request, maxBod
                 if (closed || revisions.get(id) !== revision) throw new PluginError(409, 'BRIDGE_UPDATE_SUPERSEDED', 'A newer bridge update replaced this request.');
                 const key = previous && !body.rotateKey ? previous.key : randomBytes(32).toString('base64url');
                 if (previous) revoke(previous);
-                const state = { key, connection, directories, credentialSnapshot: resolved.credentialSnapshot };
+                const state = { key, connection, directories, credentialSnapshot: resolved.credentialSnapshot, debugLocalAccess: body.debugLocalAccess ?? previous?.debugLocalAccess ?? false };
                 states.set(id, state); keys.set(key, state);
                 response.set?.('Cache-Control', 'no-store');
                 return response.json(view(state));

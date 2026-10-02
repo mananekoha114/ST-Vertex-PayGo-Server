@@ -2,6 +2,8 @@
 
 ## 未发布 · Google OpenAI 兼容桥接
 
+- 增加按用户控制的 localhost 浏览器 CORS Debug 选项，默认关闭，实际请求继续要求桥接 key。
+- 模型列表接入 AI Studio 官方 OpenAI 目录及 Vertex 官方 Publisher Model 分页目录，保留官方 OpenAI 生成转发路径。
 - 为 ST/Luker 增加默认关闭、按用户隔离的本机 `/openai/v1` 入口及已登录用户管理接口。
 - 仅转发 Google AI Studio 与 Vertex AI 官方 OpenAI 兼容端点；支持 AI Studio key 和 Vertex 服务账号 OAuth，不支持 Express、不执行原生协议转换或失败回退。
 - 支持固定连接、`st-current` 别名、JSON/SSE 透传、访问 key 轮换和撤销；重启后关闭。

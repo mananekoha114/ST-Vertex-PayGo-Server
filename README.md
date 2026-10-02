@@ -45,11 +45,26 @@ POST 请求示例（配置中没有 Google 凭据明文）：
 
 `secretId` 可选择宿主已保存的凭据。未指定时在启用阶段绑定当前凭据，不随主界面后续换号。`{"enabled": false}` 关闭并撤销访问；`{"enabled": true, "rotateKey": true}` 沿用已绑定连接并轮换桥接 key。
 
+管理状态包含 `debugLocalAccess`，默认 `false`。启用桥接时可一并提交该布尔值；已启用时用 `{"enabled": true, "debugLocalAccess": true}` 开启本机浏览器跨域调试，传 `false` 关闭。省略时保留原值，关闭桥接或重启后恢复关闭。调试设置更新同样会取消未完成请求。
+
 启用后，返回 Base URL `http://127.0.0.1:<动态端口>/openai/v1`。调用方使用独立桥接 key 作为 Bearer 凭据，调用 `GET /models` 或 `POST /chat/completions`。模型别名 `st-current` 表示**桥接绑定模型**，并非实时主聊天模型。调用者也可显式选择合法的 `gemini-*` 模型；Vertex 会添加 `google/` 前缀。
+
+### 模型目录
+
+`GET /openai/v1/models` 每次查询绑定提供商的官方模型目录，并返回 OpenAI 格式的 `data` 数组，包含 `st-current`、绑定模型及发现的 Gemini 模型。不使用 PayGo 支持名单限制选模，也不发送生成请求探测模型。
+
+- AI Studio：`GET https://generativelanguage.googleapis.com/v1beta/openai/models`，使用绑定 key 的 Bearer 认证。
+- Vertex Full：`GET https://{regional-host}/v1beta1/publishers/google/models?view=PUBLISHER_MODEL_VIEW_FULL&listAllVersions=true&pageSize=100`，使用绑定服务账号的 OAuth；`global` 使用 `aiplatform.googleapis.com`，其他区域使用 `{region}-aiplatform.googleapis.com`。跟随 `nextPageToken` 遍历分页，不跟随任意上游 URL。
+- 仅返回合法 Gemini 模型名称，过滤 embedding、Live、原生音频、TTS 专用名称并去重；不把目录内部 `versionId` 拼成调用 ID。Vertex 返回 `google/gemini-*`，AI Studio 返回 `gemini-*`。
+- 目录不代表项目、区域或 Chat Completions 的调用权限保证。调用端可直接在 `model` 指定具体名称，实际支持由 Google 校验；生成仍只走官方 OpenAI Chat Completions。
+- 查询错误直接返回，不用静态列表掩盖失败。目录查询也受鉴权、取消、并发与总超时限制；最多读取 100 页、累计 8 MiB，超过限制明确报错，不返回截断名单。
+
+Vertex 仅对模型目录元数据整理成 OpenAI 列表格式，不转换任何生成请求或生成响应。参考：[AI Studio 模型发现](https://ai.google.dev/gemini-api/docs/openai#list_models)、[Vertex 官方模型目录](https://docs.cloud.google.com/gemini-enterprise-agent-platform/reference/rest/v1beta1/publishers.models/list)。
 
 ### 生命周期与隔离
 
-- 复用绑定 `127.0.0.1` 的回环监听器，不提供外网监听和浏览器跨域调用。第三方插件应通过 ST/Luker 后端请求该地址。
+- 复用绑定 `127.0.0.1` 的回环监听器，不提供外网监听。本机命令行、SDK、ST/Luker 插件及其他服务均可持桥接 key 调用，不限定客户端软件。
+- 默认不允许浏览器跨域。`debugLocalAccess` 开启后，仅允许 `http(s)://localhost`、`http(s)://127.0.0.1`、`http(s)://[::1]` 的任意端口来源；不允许 `null`、`file://` 或公网来源。预检不要求 Bearer，但实际请求必须匹配已开启 Debug 的用户 key，不共享其他用户的调试权限；不开放管理接口 CORS。
 - 每个宿主用户使用独立连接和随机桥接 key。请求只使用该用户绑定的 Google 凭据；不转发调用方的认证头、Cookie 或自定义上游地址。
 - 配置和桥接 key 仅在内存中存活；宿主重启后功能关闭，地址和 key 需要重新复制。关闭、手动更新连接或轮换 key 都会取消对应未完成请求；关闭和轮换还会撤销旧 key。
 - 显式选择的凭据不存在时拒绝，不回退其他账号。宿主不能提供活动凭据 ID 时，使用私有凭据快照；检测到活动凭据改变或删除后停止请求，需手动更新连接。

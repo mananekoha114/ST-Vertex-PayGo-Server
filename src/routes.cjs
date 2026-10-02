@@ -38,6 +38,7 @@ function registerRoutes(router, dependencies) {
                 clientLogging: isAdmin,
                 usage: true,
                 openaiBridge: Boolean(dependencies.openaiBridge),
+                openaiBridgeDebug: Boolean(dependencies.openaiBridge),
             },
         });
     });
