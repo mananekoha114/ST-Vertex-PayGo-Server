@@ -12,14 +12,44 @@ const fs = require('node:fs/promises');
 const path = require('node:path');
 const { randomUUID } = require('node:crypto');
 const MAX_CAPTURE_BYTES = 1024 * 1024;
+// Match escaped JSON strings without parsing/reformatting whole JSON or SSE documents.
+// If decoding reveals a credential, omit the field: source offsets are ambiguous in
+// nested strings and truncated captures. Limit decoding passes to bound CPU work.
 function redact(value, secrets) {
     let text = String(value ?? '');
-    for (const secret of secrets.filter(value => typeof value === 'string' && value.length)) {
-        text = text.split(secret).join('[redacted]');
-        // Capture may stop in the middle of a known credential. Remove its partial suffix too.
-        for (let length = Math.min(secret.length - 1, text.length); length >= 4; length--) {
-            if (text.endsWith(secret.slice(0, length))) { text = text.slice(0, -length) + '[redacted]'; break; }
+    const known = [...new Set(secrets.filter(value => typeof value === 'string' && value.length))];
+    const suffixLength = (value, secret) => {
+        // KMP computes the longest credential prefix at the capture boundary in linear time.
+        const prefix = new Uint32Array(secret.length);
+        for (let i = 1, j = 0; i < secret.length; i++) {
+            while (j && secret[i] !== secret[j]) j = prefix[j - 1];
+            if (secret[i] === secret[j]) j++;
+            prefix[i] = j;
         }
+        let matched = 0;
+        for (let i = Math.max(0, value.length - secret.length); i < value.length; i++) {
+            while (matched && value[i] !== secret[matched]) matched = prefix[matched - 1];
+            if (value[i] === secret[matched]) matched++;
+            if (matched === secret.length && i < value.length - 1) matched = prefix[matched - 1];
+        }
+        return matched >= 4 ? matched : 0;
+    };
+    let decoded = text;
+    const escape = /\\(?:u[0-9a-fA-F]{4}|["\\/bfnrt])/gu;
+    const controls = { b: '\b', f: '\f', n: '\n', r: '\r', t: '\t' };
+    for (let pass = 0; known.length && pass < 8; pass++) {
+        const next = decoded.replace(escape, match => match[1] === 'u' ? String.fromCharCode(parseInt(match.slice(2), 16)) : (controls[match[1]] ?? match[1]));
+        if (next === decoded) break;
+        decoded = next;
+        if (known.some(secret => decoded.includes(secret) || suffixLength(decoded, secret))) return '[omitted: credential in escaped body]';
+        if (pass === 7 && /\\/u.test(decoded)) return '[omitted: deeply escaped body]';
+    }
+    // An incomplete escape can hide the final character of a credential prefix.
+    if (known.length && /\\(?:u[0-9a-fA-F]{0,3})?$/u.test(decoded)) return '[omitted: incomplete escaped body]';
+    for (const secret of known) {
+        text = text.split(secret).join('[redacted]');
+        const length = suffixLength(text, secret);
+        if (length) text = text.slice(0, -length) + '[redacted]';
     }
     return text;
 }

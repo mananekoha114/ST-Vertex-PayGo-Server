@@ -135,6 +135,17 @@ test('explicit Vertex Express and Full secrets use the selected host secret only
         { key: 'vertex-key', id: 'express-selected' },
         { key: 'vertex-sa', id: 'full-selected' },
     ]);
+    const bridgeRequest = { user: { directories: { root: 'user' } } };
+    const selected = runtime.resolveOpenAIConnection(bridgeRequest, {
+        source: 'vertexai', model: 'gemini-2.5-flash', authMode: 'full', region: 'global', secretId: 'full-selected',
+    });
+    assert.equal(selected.credentialSnapshot, undefined);
+    assert.equal(selected.logCredential, JSON.stringify(selectedServiceAccount));
+    for (const authenticate of [false, true]) {
+        const config = await runtime.getOpenAIConfig(bridgeRequest, selected.connection, authenticate);
+        assert.equal(config.logCredential, JSON.stringify(selectedServiceAccount));
+        assert.equal(Boolean(config.headers), authenticate);
+    }
 });
 
 test('bridge pins active IDs when exposed and snapshots credentials on older hosts', async () => {
@@ -150,8 +161,10 @@ test('bridge pins active IDs when exposed and snapshots credentials on older hos
     const request = { user: { directories: { root: 'alice' } } };
     const selected = runtime.resolveOpenAIConnection(request, { source: 'makersuite', model: 'gemini-2.5-flash' });
     assert.equal(selected.connection.secretId, 'first');
+    assert.equal(selected.logCredential, 'credential-first');
     active = 'second';
     assert.equal((await runtime.getOpenAIConfig(request, selected.connection)).headers.Authorization, 'Bearer credential-first');
+    assert.equal((await runtime.getOpenAIConfig(request, selected.connection)).logCredential, 'credential-first');
     assert.equal(selected.credentialSnapshot, undefined);
 
     const oldRuntime = await loadStRuntime({

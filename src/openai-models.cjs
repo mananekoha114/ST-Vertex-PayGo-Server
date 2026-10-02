@@ -9,6 +9,7 @@
 'use strict';
 
 const { PluginError } = require('./errors.cjs');
+const { BoundedBuffer } = require('./bounded-buffer.cjs');
 const MODEL = /^gemini-[a-z0-9][a-z0-9._-]*$/u;
 function normalizeModel(value, source) {
     if (typeof value !== 'string') return null;
@@ -37,15 +38,15 @@ async function discoverModels({ config, connection, upstreamRequest, operation }
                 if (operation.terminal) { response.destroy(); return; }
                 const status = response.statusCode || 502;
                 if (status >= 300 && status < 400) { response.destroy(); reject(new PluginError(502, 'GOOGLE_MODEL_DISCOVERY_FAILED', 'Google model discovery returned a redirect.')); return; }
-                const chunks = [];
+                const chunks = new BoundedBuffer(8 * 1024 * 1024 - bytes);
                 response.on('data', chunk => {
                     bytes += chunk.length;
                     if (bytes > 8 * 1024 * 1024) { response.destroy(); reject(new PluginError(502, 'GOOGLE_MODEL_RESPONSE_TOO_LARGE', 'Google model discovery exceeded the response limit.')); return; }
-                    chunks.push(chunk);
+                    chunks.append(chunk);
                 });
                 response.once('error', () => reject(new PluginError(502, 'GOOGLE_UPSTREAM_FAILED', 'The Google connection failed.')));
                 response.once('end', () => {
-                    const body = Buffer.concat(chunks).toString('utf8');
+                    const body = chunks.toBuffer().toString('utf8');
                     let data;
                     try { data = JSON.parse(body); } catch { if (status >= 200 && status < 300) { reject(new PluginError(502, 'INVALID_GOOGLE_MODELS', 'Google returned an invalid model catalog.')); return; } }
                     if (status < 200 || status >= 300) {

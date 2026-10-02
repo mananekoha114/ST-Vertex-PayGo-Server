@@ -47,6 +47,127 @@ function fakeGoogle(calls, reply = {}) {
         return request;
     };
 }
+
+test('timed-out authentication retains global and user capacity across key rotation', async () => {
+    for (const limits of [{ maxGlobal: 1, maxPerUser: 4 }, { maxGlobal: 4, maxPerUser: 1 }]) {
+        let pending = 0; let release; let blocked = true;
+        const gate = new Promise(resolve => { release = resolve; });
+        const calls = [];
+        const bridge = createOpenAIBridge({ ...limits, timeoutMs: 30, upstreamRequest: fakeGoogle(calls), stRuntime: {
+            resolveOpenAIConnection: (_request, connection) => ({ connection }),
+            async getOpenAIConfig(_request, _connection, authenticate) {
+                if (authenticate && blocked) { pending++; try { await gate; } finally { pending--; } }
+                return { target: 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', headers: { Authorization: 'Bearer fake-google' } };
+            },
+        } });
+        const transport = createLoopbackTransport({ openaiBridge: bridge });
+        await transport.start(); bridge.setBaseUrl(transport.baseUrl);
+        try {
+            const enabled = managerResponse();
+            await bridge.update({ ...user('alice'), body: { enabled: true, connection: { source: 'makersuite', model: 'gemini-2.5-flash' } } }, enabled);
+            const get = key => fetch(`${transport.baseUrl}/openai/v1/models`, { headers: { Authorization: `Bearer ${key}` } });
+            const timed = await get(enabled.body.apiKey); assert.equal(timed.status, 504); await timed.text();
+            assert.equal(pending, 1);
+            for (let index = 0; index < 3; index++) {
+                const busy = await get(enabled.body.apiKey); assert.equal(busy.status, 429); await busy.text();
+            }
+            const rotated = managerResponse(); await bridge.update({ ...user('alice'), body: { enabled: true, rotateKey: true } }, rotated);
+            const busy = await get(rotated.body.apiKey); assert.equal(busy.status, 429); await busy.text();
+            assert.equal(pending, 1);
+            blocked = false; release(); await until(() => pending === 0);
+            const next = await get(rotated.body.apiKey); assert.equal(next.status, 200); await next.text();
+            assert.equal(calls.length, 0);
+        } finally { release(); bridge.close(); await transport.close(); }
+    }
+});
+
+test('real truncated HTTP upstream fails discovery and aborts streamed completions', async () => {
+    const source = http.createServer((request, response) => {
+        request.resume();
+        response.writeHead(200, { 'Content-Type': request.method === 'GET' ? 'application/json' : 'text/event-stream', 'Content-Length': '1000' });
+        response.write(request.method === 'GET' ? '{"data":[' : 'data: {"partial":true}\n\n');
+        setTimeout(() => response.destroy(), 30);
+    });
+    await new Promise(resolve => source.listen(0, '127.0.0.1', resolve));
+    const bridge = createOpenAIBridge({ timeoutMs: 1000, stRuntime: {
+        resolveOpenAIConnection: (_request, connection) => ({ connection }),
+        async getOpenAIConfig() { return { target: 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', headers: { Authorization: 'Bearer fake-google' } }; },
+    }, upstreamRequest(_target, options, callback) { return http.request(`http://127.0.0.1:${source.address().port}`, options, callback); } });
+    const transport = createLoopbackTransport({ openaiBridge: bridge });
+    await transport.start(); bridge.setBaseUrl(transport.baseUrl);
+    try {
+        const enabled = managerResponse(); await bridge.update({ ...user('alice'), body: { enabled: true, connection: { source: 'makersuite', model: 'gemini-2.5-flash' } } }, enabled);
+        const headers = { Authorization: `Bearer ${enabled.body.apiKey}` };
+        const models = await fetch(`${transport.baseUrl}/openai/v1/models`, { headers });
+        assert.equal(models.status, 502); assert.equal((await models.json()).error.code, 'GOOGLE_UPSTREAM_FAILED');
+        const completion = await new Promise((resolve, reject) => {
+            const request = http.request(`${transport.baseUrl}/openai/v1/chat/completions`, { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' } }, response => {
+                let aborted = false; let ended = false;
+                response.resume();
+                response.once('aborted', () => { aborted = true; });
+                response.once('end', () => { ended = true; });
+                response.on('error', () => {});
+                response.once('close', () => resolve({ status: response.statusCode, aborted, ended }));
+            });
+            request.once('error', reject);
+            request.end('{"messages":[{"role":"user","content":"hello"}],"stream":true}');
+        });
+        assert.deepEqual(completion, { status: 200, aborted: true, ended: false });
+    } finally { bridge.close(); await transport.close(); source.closeAllConnections(); await new Promise(resolve => source.close(resolve)); }
+});
+
+test('authentication lease survives client disconnect and disable/re-enable, then releases on rejection', async () => {
+    for (const interruption of ['disconnect', 'disable']) {
+        let authCalls = 0; let pending = 0; let rejectAuth; let blocked = true;
+        const gate = new Promise((_resolve, reject) => { rejectAuth = reject; });
+        let upstreamCalls = 0;
+        const google = fakeGoogle([]);
+        const bridge = createOpenAIBridge({ maxGlobal: 4, maxPerUser: 1, timeoutMs: 1000,
+            upstreamRequest(...args) { upstreamCalls++; return google(...args); },
+            stRuntime: {
+                resolveOpenAIConnection: (_request, connection) => ({ connection }),
+                async getOpenAIConfig(_request, _connection, authenticate) {
+                    if (authenticate) {
+                        authCalls++;
+                        if (blocked) { pending++; try { await gate; } finally { pending--; } }
+                    }
+                    return { target: 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', headers: { Authorization: 'Bearer fake-google' } };
+                },
+            },
+        });
+        const transport = createLoopbackTransport({ openaiBridge: bridge });
+        await transport.start(); bridge.setBaseUrl(transport.baseUrl);
+        try {
+            const configure = async body => {
+                const result = managerResponse(); await bridge.update({ ...user('alice'), body }, result);
+                assert.equal(result.code, 200); return result.body;
+            };
+            const connection = { source: 'makersuite', model: 'gemini-2.5-flash' };
+            let state = await configure({ enabled: true, connection });
+            const url = `${transport.baseUrl}/openai/v1/models`;
+            const get = key => fetch(url, { headers: { Authorization: `Bearer ${key}` } });
+            let request;
+            const clientClosed = new Promise(resolve => {
+                request = http.get(url, { headers: { Authorization: `Bearer ${state.apiKey}` } });
+                request.on('error', () => {});
+                request.once('close', resolve);
+            });
+            await until(() => pending === 1);
+            if (interruption === 'disconnect') request.destroy();
+            else {
+                await configure({ enabled: false });
+                state = await configure({ enabled: true, connection });
+            }
+            await clientClosed;
+            const busy = await get(state.apiKey); assert.equal(busy.status, 429); await busy.text();
+            assert.equal(authCalls, 1); assert.equal(pending, 1); assert.equal(upstreamCalls, 0);
+            blocked = false; rejectAuth(new Error('Simulated OAuth rejection'));
+            await until(() => pending === 0);
+            const recovered = await get(state.apiKey); assert.equal(recovered.status, 200); await recovered.text();
+            assert.equal(authCalls, 2); assert.equal(upstreamCalls, 1);
+        } finally { blocked = false; rejectAuth(new Error('Test cleanup')); bridge.close(); await transport.close(); }
+    }
+});
 async function setup(reply) {
     const calls = [];
     const stRuntime = {

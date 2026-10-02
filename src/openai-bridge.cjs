@@ -12,6 +12,7 @@ const { randomBytes, createHash } = require('node:crypto');
 const https = require('node:https');
 const { Transform } = require('node:stream');
 const { MAX_CAPTURE_BYTES } = require('./bridge-log-store.cjs');
+const { BoundedBuffer } = require('./bounded-buffer.cjs');
 const { PluginError, sendExpressError } = require('./errors.cjs');
 const { discoverModels, validatedTarget } = require('./openai-models.cjs');
 
@@ -103,13 +104,17 @@ function createOpenAIBridge({ stRuntime, upstreamRequest = https.request, maxBod
         const capture = (field, chunk, encoding) => {
             if (!entry || chunk === undefined || chunk === null) return;
             const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, typeof encoding === 'string' ? encoding : undefined);
-            const current = captures.get(field) || { chunks: [], size: 0 };
-            const remaining = MAX_CAPTURE_BYTES - current.size;
-            if (bytes.length > remaining) entry.truncated = true;
-            if (remaining > 0) { const part = Buffer.from(bytes.subarray(0, remaining)); current.chunks.push(part); current.size += part.length; }
+            const current = captures.get(field) || new BoundedBuffer(MAX_CAPTURE_BYTES);
+            if (!current.append(bytes)) entry.truncated = true;
             captures.set(field, current);
         };
         if (bridgeLogStore && logState) {
+            // A named credential can change while the bridge remains enabled. Refresh
+            // only redaction material, including for requests rejected before OAuth.
+            try {
+                const current = stRuntime.resolveOpenAIConnection({ user: { directories: logState.directories } }, logState.connection);
+                secrets.push(...credentialValues(current.logCredential));
+            } catch { /* Credential resolution errors must not affect request logging. */ }
             entry = { id: randomBytes(16).toString('hex'), timestamp: new Date().toISOString(), method: request.method, path: request.url, status: null, durationMs: 0, requestBody: '', forwardedBody: '', responseBody: '', error: null, truncated: false, interrupted: false };
             const started = Date.now();
             const write = response.write; const end = response.end;
@@ -123,7 +128,7 @@ function createOpenAIBridge({ stRuntime, upstreamRequest = https.request, maxBod
                 }
                 entry.status ??= response.headersSent ? response.statusCode : null;
                 entry.durationMs = Date.now() - started; entry.interrupted ||= !response.writableFinished;
-                for (const [field, value] of captures) entry[field] = Buffer.concat(value.chunks).toString('utf8');
+                for (const [field, value] of captures) entry[field] = value.toBuffer().toString('utf8');
                 Promise.resolve().then(() => bridgeLogStore.append(logState.directories, entry, secrets)).catch(() => {});
             };
             response.once('finish', () => setImmediate(flush)); response.once('close', () => setImmediate(flush));
@@ -164,16 +169,28 @@ function createOpenAIBridge({ stRuntime, upstreamRequest = https.request, maxBod
         if (request.method !== method) { early(405, 'METHOD_NOT_ALLOWED', `${method} is required.`); return true; }
         if (!modelsRequest && !/^application\/json(?:\s*;|$)/iu.test(request.headers['content-type'] || '')) { early(415, 'JSON_REQUIRED', 'A JSON body is required.'); return true; }
         if (Number(request.headers['content-length']) > maxBodyBytes) { early(413, 'REQUEST_BODY_TOO_LARGE', 'The request body is too large.'); return true; }
-        if (active.size >= maxGlobal || [...active].filter(item => item.state === state).length >= maxPerUser) { early(429, 'BRIDGE_BUSY', 'The bridge concurrency limit was reached.'); return true; }
-        const operation = { state, terminal: false, upstream: null, timer: null, rejectBody: null, cleanupBody: null };
+        const ownerId = userId({ user: { directories: state.directories } });
+        if (active.size >= maxGlobal || [...active].filter(item => item.ownerId === ownerId).length >= maxPerUser) { early(429, 'BRIDGE_BUSY', 'The bridge concurrency limit was reached.'); return true; }
+        const operation = { state, ownerId, terminal: false, authPending: false, upstream: null, timer: null, rejectBody: null, cleanupBody: null };
         active.add(operation);
         const done = () => {
             if (operation.terminal) return false;
             operation.terminal = true;
             clearTimeout(operation.timer);
             operation.cleanupBody?.();
-            active.delete(operation);
+            if (!operation.authPending) active.delete(operation);
             return true;
+        };
+        const authenticate = async () => {
+            // The host OAuth helper cannot be cancelled. Keep its lease until it
+            // settles even when the client deadline or key revocation ends work.
+            operation.authPending = true;
+            try {
+                return await stRuntime.getOpenAIConfig({ user: { directories: state.directories } }, state.connection, true, state.credentialSnapshot);
+            } finally {
+                operation.authPending = false;
+                if (operation.terminal) active.delete(operation);
+            }
         };
         const cancel = () => {
             if (entry) { entry.interrupted = true; entry.error ||= 'BRIDGE_CANCELLED: The request was interrupted.'; }
@@ -200,8 +217,8 @@ function createOpenAIBridge({ stRuntime, upstreamRequest = https.request, maxBod
         (async () => {
             try {
                 if (modelsRequest) {
-                    const config = await stRuntime.getOpenAIConfig({ user: { directories: state.directories } }, state.connection, true, state.credentialSnapshot);
-                    secrets.push(config.headers?.Authorization, config.headers?.Authorization?.replace(/^Bearer /u, ''));
+                    const config = await authenticate();
+                    secrets.push(...credentialValues(config.logCredential), config.headers?.Authorization, config.headers?.Authorization?.replace(/^Bearer /u, ''));
                     if (operation.terminal || keys.get(state.key) !== state) return;
                     // Tap discovery pages through a Transform so collection preserves upstream backpressure.
                     let discoveryPage = 0;
@@ -219,7 +236,7 @@ function createOpenAIBridge({ stRuntime, upstreamRequest = https.request, maxBod
                     if (operation.terminal || !catalog) return;
                     done(); response.setHeader('Content-Type', 'application/json'); response.end(JSON.stringify(catalog)); return;
                 }
-                const chunks = []; let bytes = 0;
+                const chunks = new BoundedBuffer(maxBodyBytes); let bytes = 0;
                 await new Promise((resolve, reject) => {
                     const cleanup = () => {
                         request.removeListener('data', onData);
@@ -232,7 +249,7 @@ function createOpenAIBridge({ stRuntime, upstreamRequest = https.request, maxBod
                         capture('requestBody', chunk);
                         bytes += chunk.length;
                         if (bytes > maxBodyBytes) { cleanup(); reject(new PluginError(413, 'REQUEST_BODY_TOO_LARGE', 'The request body is too large.')); return; }
-                        chunks.push(chunk);
+                        chunks.append(chunk);
                     };
                     const onEnd = () => { cleanup(); resolve(); };
                     const onError = cause => { cleanup(); reject(cause); };
@@ -244,7 +261,7 @@ function createOpenAIBridge({ stRuntime, upstreamRequest = https.request, maxBod
                 });
                 if (operation.terminal) return;
                 let payload;
-                try { payload = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { throw new PluginError(400, 'INVALID_JSON', 'The request body is not valid JSON.'); }
+                try { payload = JSON.parse(chunks.toBuffer().toString('utf8')); } catch { throw new PluginError(400, 'INVALID_JSON', 'The request body is not valid JSON.'); }
                 if (!payload || typeof payload !== 'object' || Array.isArray(payload) || !Array.isArray(payload.messages) || payload.messages.length === 0 || payload.messages.some(message => !message || typeof message !== 'object' || typeof message.role !== 'string')) throw new PluginError(400, 'INVALID_MESSAGES', 'A nonempty messages array is required.');
                 if (Object.keys(payload).some(key => FORBIDDEN.test(key))) throw new PluginError(400, 'FORBIDDEN_FIELD', 'The request contains an internal routing or credential field.');
                 const model = payload.model ?? 'st-current';
@@ -252,8 +269,8 @@ function createOpenAIBridge({ stRuntime, upstreamRequest = https.request, maxBod
                 payload.model = model === 'st-current' ? state.connection.model : model;
                 if (state.connection.source === 'vertexai' && !payload.model.startsWith('google/')) payload.model = `google/${payload.model}`;
                 if (state.connection.source === 'makersuite' && payload.model.startsWith('google/')) payload.model = payload.model.slice(7);
-                const config = await stRuntime.getOpenAIConfig({ user: { directories: state.directories } }, state.connection, true, state.credentialSnapshot);
-                secrets.push(config.headers?.Authorization, config.headers?.Authorization?.replace(/^Bearer /u, ''));
+                const config = await authenticate();
+                secrets.push(...credentialValues(config.logCredential), config.headers?.Authorization, config.headers?.Authorization?.replace(/^Bearer /u, ''));
                 if (operation.terminal || keys.get(state.key) !== state || response.writableEnded) return;
                 const target = validatedTarget(config, state.connection);
                 const body = Buffer.from(JSON.stringify(payload));
@@ -311,7 +328,7 @@ function createOpenAIBridge({ stRuntime, upstreamRequest = https.request, maxBod
                 if (closed || revisions.get(id) !== revision) throw new PluginError(409, 'BRIDGE_UPDATE_SUPERSEDED', 'A newer bridge update replaced this request.');
                 const key = previous && !body.rotateKey ? previous.key : randomBytes(32).toString('base64url');
                 if (previous) revoke(previous);
-                const state = { key, connection, directories, logSecrets: [...credentialValues(resolved.credentialSnapshot), checkedConfig?.headers?.Authorization, checkedConfig?.headers?.Authorization?.replace(/^Bearer /u, '')], credentialSnapshot: resolved.credentialSnapshot, debugLocalAccess: body.debugLocalAccess ?? previous?.debugLocalAccess ?? false };
+                const state = { key, connection, directories, logSecrets: [...credentialValues(resolved.logCredential), ...credentialValues(resolved.credentialSnapshot), ...credentialValues(checkedConfig?.logCredential), checkedConfig?.headers?.Authorization, checkedConfig?.headers?.Authorization?.replace(/^Bearer /u, '')], credentialSnapshot: resolved.credentialSnapshot, debugLocalAccess: body.debugLocalAccess ?? previous?.debugLocalAccess ?? false };
                 states.set(id, state); keys.set(key, state);
                 response.set?.('Cache-Control', 'no-store');
                 return response.json(view(state));

@@ -182,7 +182,7 @@ async function loadStRuntime({
         }
         const credential = secretsModule.readSecret(directories, secretKey, secretId);
         if (typeof credential !== 'string' || !credential) throw new PluginError(400, 'GOOGLE_SECRET_NOT_FOUND', 'The selected Google credential was not found.');
-        return { connection: Object.freeze({ ...connection, ...(secretId ? { secretId } : {}) }), credentialSnapshot: secretId ? undefined : credential };
+        return { connection: Object.freeze({ ...connection, ...(secretId ? { secretId } : {}) }), credentialSnapshot: secretId ? undefined : credential, logCredential: credential };
     };
 
     const getOpenAIConfig = async (request, connection, authenticate = true, credentialSnapshot) => {
@@ -198,7 +198,7 @@ async function loadStRuntime({
         if (source === 'makersuite') {
             const apiKey = credentialSnapshot ?? secretsModule.readSecret(directories, secretsModule.SECRET_KEYS.MAKERSUITE, secretId);
             if (!apiKey || typeof apiKey !== 'string') throw new PluginError(400, 'GOOGLE_SECRET_NOT_FOUND', 'The selected Google AI Studio secret was not found.');
-            return { target: 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', headers: { Authorization: `Bearer ${apiKey}` } };
+            return { target: 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', headers: { Authorization: `Bearer ${apiKey}` }, logCredential: apiKey };
         }
         if (source !== 'vertexai' || connection.authMode !== 'full') throw new PluginError(400, 'VERTEX_AUTH_UNSUPPORTED', 'Vertex AI requires full service-account authentication.');
         const helpers = ['generateJWTToken', 'getAccessToken', 'getProjectIdFromServiceAccount'];
@@ -215,11 +215,11 @@ async function loadStRuntime({
         if (!/^[a-z][a-z0-9-]{4,62}$/u.test(projectId)) throw new PluginError(400, 'VERTEX_AUTH_CONFIGURATION_FAILED', 'The Vertex project ID is invalid.');
         const host = region === 'global' ? 'aiplatform.googleapis.com' : `${region}-aiplatform.googleapis.com`;
         const target = `https://${host}/v1/projects/${projectId}/locations/${region}/endpoints/openapi/chat/completions`;
-        if (!authenticate) return { target };
+        if (!authenticate) return { target, logCredential: serialized };
         try {
             const token = await googleModule.getAccessToken(await googleModule.generateJWTToken(serviceAccount));
             if (typeof token !== 'string' || !token) throw new Error('Missing token');
-            return { target, headers: { Authorization: `Bearer ${token}` } };
+            return { target, headers: { Authorization: `Bearer ${token}` }, logCredential: serialized };
         } catch {
             throw new PluginError(502, 'VERTEX_AUTH_FAILED', 'The Vertex service account could not be authenticated.');
         }
