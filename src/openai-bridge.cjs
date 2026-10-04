@@ -15,6 +15,8 @@ const { MAX_CAPTURE_BYTES } = require('./bridge-log-store.cjs');
 const { BoundedBuffer } = require('./bounded-buffer.cjs');
 const { PluginError, sendExpressError } = require('./errors.cjs');
 const { discoverModels, validatedTarget } = require('./openai-models.cjs');
+const { buildPayGoHeaders } = require('./header-policy.cjs');
+const { validateBridgePolicy, effectiveBridgeTier } = require('./bridge-tier.cjs');
 
 const MAX_BODY = 16 * 1024 * 1024;
 const FORBIDDEN = /^(?:reverse_proxy|custom_url|proxy_password|apiKey|chat_completion_source|secret_id|secretId|authorization|headers|url|base_url)$/iu;
@@ -74,7 +76,7 @@ function userId(request) {
     return createHash('sha256').update(root).digest('hex');
 }
 
-function createOpenAIBridge({ stRuntime, upstreamRequest = https.request, maxBodyBytes = MAX_BODY, timeoutMs = 180_000, maxGlobal = 16, maxPerUser = 4, bridgeLogStore } = {}) {
+function createOpenAIBridge({ stRuntime, upstreamRequest = https.request, maxBodyBytes = MAX_BODY, timeoutMs, maxGlobal = 16, maxPerUser = 4, bridgeLogStore } = {}) {
     const states = new Map();
     const keys = new Map();
     const active = new Set();
@@ -89,6 +91,14 @@ function createOpenAIBridge({ stRuntime, upstreamRequest = https.request, maxBod
         if (!state) return;
         keys.delete(state.key);
         for (const operation of [...active]) if (operation.state === state) operation.cancel();
+    }
+    async function policyView(state) {
+        const result = view(state);
+        if (state?.connection.source === 'vertexai') {
+            Object.assign(result, { mode: state.mode, tierSource: state.tierSource, tier: state.tier, effectiveTier: null, tierError: null });
+            try { result.effectiveTier = (await effectiveBridgeTier(state, stRuntime)).tier; } catch (cause) { result.tierError = cause.message; }
+        }
+        return result;
     }
     function route(request, response) {
         if (!request.url?.startsWith('/openai/')) return false;
@@ -211,7 +221,9 @@ function createOpenAIBridge({ stRuntime, upstreamRequest = https.request, maxBod
             request.resume();
         };
         operation.cancel = cancel;
-        operation.timer = setTimeout(() => fail(504, 'GOOGLE_TIMEOUT', 'The bridge request timed out.'), timeoutMs);
+        const startedAt = Date.now();
+        const deadline = duration => { clearTimeout(operation.timer); operation.timer = setTimeout(() => fail(504, 'GOOGLE_TIMEOUT', 'The bridge request timed out.'), Math.max(1, duration - (Date.now() - startedAt))); };
+        deadline(timeoutMs ?? 180_000);
         response.once('close', () => { if (!response.writableEnded) cancel(); else { done(); operation.upstream?.destroy(); } });
         request.once('aborted', cancel);
         (async () => {
@@ -264,22 +276,66 @@ function createOpenAIBridge({ stRuntime, upstreamRequest = https.request, maxBod
                 try { payload = JSON.parse(chunks.toBuffer().toString('utf8')); } catch { throw new PluginError(400, 'INVALID_JSON', 'The request body is not valid JSON.'); }
                 if (!payload || typeof payload !== 'object' || Array.isArray(payload) || !Array.isArray(payload.messages) || payload.messages.length === 0 || payload.messages.some(message => !message || typeof message !== 'object' || typeof message.role !== 'string')) throw new PluginError(400, 'INVALID_MESSAGES', 'A nonempty messages array is required.');
                 if (Object.keys(payload).some(key => FORBIDDEN.test(key))) throw new PluginError(400, 'FORBIDDEN_FIELD', 'The request contains an internal routing or credential field.');
+                if (state.connection.source === 'vertexai' && Object.keys(payload).some(key => /^(?:service_tier|serviceTier)$/iu.test(key))) throw new PluginError(400, 'FORBIDDEN_FIELD', 'The bridge tier is controlled by its server policy.');
                 const model = payload.model ?? 'st-current';
                 if (model !== 'st-current' && (typeof model !== 'string' || !modelPattern.test(model))) throw new PluginError(400, 'INVALID_MODEL', 'The model is invalid.');
                 payload.model = model === 'st-current' ? state.connection.model : model;
                 if (state.connection.source === 'vertexai' && !payload.model.startsWith('google/')) payload.model = `google/${payload.model}`;
                 if (state.connection.source === 'makersuite' && payload.model.startsWith('google/')) payload.model = payload.model.slice(7);
+                const tierPolicy = await effectiveBridgeTier(state, stRuntime);
+                if (operation.terminal || keys.get(state.key) !== state) return;
+                if (tierPolicy.tier === 'flex') deadline(timeoutMs ?? 1_800_000);
                 const config = await authenticate();
                 secrets.push(...credentialValues(config.logCredential), config.headers?.Authorization, config.headers?.Authorization?.replace(/^Bearer /u, ''));
                 if (operation.terminal || keys.get(state.key) !== state || response.writableEnded) return;
                 const target = validatedTarget(config, state.connection);
-                const body = Buffer.from(JSON.stringify(payload));
+                const gateway = state.connection.source === 'vertexai' && state.mode === 'gemini';
+                let forwarded = payload;
+                if (gateway) {
+                    const { toGeminiRequest } = require('./gemini-openai.cjs');
+                    forwarded = toGeminiRequest(payload);
+                    target.pathname = target.pathname.replace(/\/endpoints\/openapi\/chat\/completions$/u, `/publishers/google/models/${payload.model.replace(/^google\//u, '')}:${payload.stream === true ? 'streamGenerateContent' : 'generateContent'}`);
+                    if (payload.stream === true) target.search = 'alt=sse';
+                }
+                const body = Buffer.from(JSON.stringify(forwarded));
                 capture('forwardedBody', body);
-                const upstream = upstreamRequest(target, { method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': body.length, 'Accept-Encoding': 'identity', Authorization: config.headers.Authorization } }, upstreamResponse => {
+                const policyHeaders = state.connection.source === 'vertexai' ? buildPayGoHeaders({ source: 'vertexai', ...tierPolicy }) : {};
+                const upstream = upstreamRequest(target, { method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': body.length, 'Accept-Encoding': 'identity', Authorization: config.headers.Authorization, ...policyHeaders } }, upstreamResponse => {
                     if (operation.terminal || response.writableEnded || response.destroyed) { upstreamResponse.destroy(); return; }
                     const status = upstreamResponse.statusCode || 502;
                     if (entry) { entry.status = status; if (status >= 400) entry.error = `GOOGLE_HTTP_ERROR: HTTP ${status}`; }
                     if (status >= 300 && status < 400) { upstreamResponse.destroy(); fail(502, 'GOOGLE_REDIRECT_REJECTED', 'Google returned a redirect.'); return; }
+                    if (gateway) {
+                        const tap = new Transform({ transform(chunk, _encoding, next) { capture('upstreamResponseBody', chunk); next(null, chunk); } });
+                        const broken = () => { tap.destroy(); if (operation.terminal) return; if (entry) entry.error = 'GOOGLE_UPSTREAM_FAILED: The Google response was interrupted.'; response.destroy(); };
+                        upstreamResponse.once('error', broken); upstreamResponse.once('aborted', broken);
+                        upstreamResponse.once('close', () => { if (!upstreamResponse.readableEnded) broken(); });
+                        tap.once('close', () => upstreamResponse.destroy());
+                        if (status < 200 || status >= 300) {
+                            const captured = new BoundedBuffer(1024 * 1024);
+                            tap.on('data', chunk => { if (!captured.append(chunk)) { fail(status, 'GOOGLE_HTTP_ERROR', 'Google rejected the gateway request.'); } });
+                            tap.once('end', () => {
+                                if (operation.terminal) return;
+                                let message = 'Google rejected the gateway request.';
+                                try { const parsed = JSON.parse(captured.toBuffer().toString('utf8')); if (typeof parsed?.error?.message === 'string') message = parsed.error.message.slice(0, 2048); } catch {}
+                                for (const secret of secrets) if (typeof secret === 'string' && secret) message = message.split(secret).join('[redacted]');
+                                if (upstreamResponse.headers?.['retry-after']) response.setHeader('Retry-After', upstreamResponse.headers['retry-after']);
+                                fail(status, 'GOOGLE_HTTP_ERROR', message);
+                            });
+                        } else {
+                            const { createGeminiResponseTransform } = require('./gemini-openai.cjs');
+                            const converted = createGeminiResponseTransform({ stream: payload.stream === true, model: payload.model, includeUsage: payload.stream_options?.include_usage === true });
+                            converted.once('error', cause => { fail(cause.status || 502, cause.code || 'INVALID_GOOGLE_RESPONSE', 'Google returned an invalid gateway response.'); });
+                            converted.once('close', () => tap.destroy());
+                            // Delay sending headers until the converter produces its
+                            // first valid chunk, so pre-output failures remain JSON errors.
+                            response.statusCode = status;
+                            response.setHeader('Cache-Control', 'no-store');
+                            response.setHeader('Content-Type', payload.stream === true ? 'text/event-stream' : 'application/json');
+                            tap.pipe(converted).pipe(response);
+                        }
+                        upstreamResponse.pipe(tap); return;
+                    }
                     const headers = { 'Cache-Control': 'no-store' };
                     for (const name of PASS_HEADERS) if (upstreamResponse.headers?.[name]) headers[name] = upstreamResponse.headers[name];
                     response.writeHead(status, headers);
@@ -299,7 +355,7 @@ function createOpenAIBridge({ stRuntime, upstreamRequest = https.request, maxBod
     return {
         setBaseUrl(value) { baseUrl = value; },
         route,
-        get(request, response) { try { response.set?.('Cache-Control', 'no-store'); return response.json(view(states.get(userId(request)))); } catch (cause) { return sendExpressError(response, cause); } },
+        get(request, response) { try { response.set?.('Cache-Control', 'no-store'); const state = states.get(userId(request)); return state?.connection.source === 'vertexai' ? policyView(state).then(value => response.json(value), cause => sendExpressError(response, cause)) : response.json(view(state)); } catch (cause) { return sendExpressError(response, cause); } },
         async getLogs(request, response) {
             try { userId(request); response.set?.('Cache-Control', 'no-store'); if (!bridgeLogStore) throw new PluginError(503, 'BRIDGE_LOGS_UNAVAILABLE', 'Bridge logs are unavailable.'); return response.json({ ok: true, entries: await bridgeLogStore.read(request.user.directories) }); } catch (cause) { return sendExpressError(response, cause); }
         },
@@ -313,7 +369,7 @@ function createOpenAIBridge({ stRuntime, upstreamRequest = https.request, maxBod
                 const revision = (revisions.get(id) || 0) + 1;
                 revisions.set(id, revision);
                 const body = request.body;
-                if (!body || typeof body !== 'object' || Array.isArray(body) || typeof body.enabled !== 'boolean' || Object.keys(body).some(key => !['enabled', 'connection', 'rotateKey', 'debugLocalAccess'].includes(key)) || (body.rotateKey !== undefined && typeof body.rotateKey !== 'boolean') || (body.debugLocalAccess !== undefined && typeof body.debugLocalAccess !== 'boolean')) throw new PluginError(400, 'INVALID_BRIDGE_CONFIG', 'The bridge configuration is invalid.');
+                if (!body || typeof body !== 'object' || Array.isArray(body) || typeof body.enabled !== 'boolean' || Object.keys(body).some(key => !['enabled', 'connection', 'rotateKey', 'debugLocalAccess', 'mode', 'tierSource', 'tier'].includes(key)) || (body.rotateKey !== undefined && typeof body.rotateKey !== 'boolean') || (body.debugLocalAccess !== undefined && typeof body.debugLocalAccess !== 'boolean')) throw new PluginError(400, 'INVALID_BRIDGE_CONFIG', 'The bridge configuration is invalid.');
                 const previous = states.get(id);
                 if (!body.enabled) { revoke(previous); states.delete(id); return response.json(view(null)); }
                 if (!baseUrl) throw new PluginError(503, 'BRIDGE_LISTENER_UNAVAILABLE', 'The bridge listener is unavailable. Check whether its fixed port is occupied and verify the listener configuration.');
@@ -324,14 +380,17 @@ function createOpenAIBridge({ stRuntime, upstreamRequest = https.request, maxBod
                     ? { connection, credentialSnapshot: previous.credentialSnapshot }
                     : stRuntime.resolveOpenAIConnection({ user: { directories } }, connection);
                 connection = resolved.connection;
+                const policy = validateBridgePolicy(body, previous, connection);
                 const checkedConfig = await stRuntime.getOpenAIConfig({ user: { directories } }, connection, false, resolved.credentialSnapshot);
                 if (closed || revisions.get(id) !== revision) throw new PluginError(409, 'BRIDGE_UPDATE_SUPERSEDED', 'A newer bridge update replaced this request.');
                 const key = previous && !body.rotateKey ? previous.key : randomBytes(32).toString('base64url');
                 if (previous) revoke(previous);
                 const state = { key, connection, directories, logSecrets: [...credentialValues(resolved.logCredential), ...credentialValues(resolved.credentialSnapshot), ...credentialValues(checkedConfig?.logCredential), checkedConfig?.headers?.Authorization, checkedConfig?.headers?.Authorization?.replace(/^Bearer /u, '')], credentialSnapshot: resolved.credentialSnapshot, debugLocalAccess: body.debugLocalAccess ?? previous?.debugLocalAccess ?? false };
+                Object.assign(state, policy);
+                state.ownerHandle = typeof request.user?.profile?.handle === 'string' ? request.user.profile.handle : previous?.ownerHandle;
                 states.set(id, state); keys.set(key, state);
                 response.set?.('Cache-Control', 'no-store');
-                return response.json(view(state));
+                return response.json(await policyView(state));
             } catch (cause) { return sendExpressError(response, cause); }
         },
         close() { closed = true; for (const state of states.values()) revoke(state); states.clear(); keys.clear(); },

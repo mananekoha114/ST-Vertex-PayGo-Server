@@ -212,7 +212,7 @@ test('route registration exposes handshake, prepare, and fail-closed sink', () =
     assert.equal(response.body.transport, 'loopback-http');
     assert.equal(response.body.pluginVersion, '0.4.0');
     assert.equal(response.body.sillyTavern.compatibleRange, '>=1.16.0');
-    assert.deepEqual(response.body.capabilities, { logs: true, clientLogging: true, usage: true, openaiBridge: false, openaiBridgeDebug: false, openaiBridgeLogs: false });
+    assert.deepEqual(response.body.capabilities, { logs: true, clientLogging: true, usage: true, openaiBridge: false, openaiBridgeDebug: false, openaiBridgeLogs: false, openaiBridgeGateway: false });
     assert.equal(Object.hasOwn(response.body, 'port'), false);
     assert.deepEqual(logEvents, []);
 
@@ -241,4 +241,32 @@ test('health advertises the bridge only when its management routes are installed
     assert.equal(response.body.capabilities.openaiBridge, true);
     assert.equal(response.body.capabilities.openaiBridgeDebug, true);
     assert.equal(response.body.capabilities.openaiBridgeLogs, true);
+    assert.equal(response.body.capabilities.openaiBridgeGateway, true);
+});
+test('Luker follows its authoritative settings repository using only the trusted owner handle', async () => {
+    for (const method of ['get', 'load']) {
+        const owners = []; const saved = { main_api: 'openai' }; let broken = false;
+        const runtime = await loadStRuntime({ rootDir: 'C:\\fake-luker', readFile: async () => JSON.stringify({ name: 'luker', version: '2.7.0' }), fileExists: () => true,
+            importModule: async specifier => specifier.endsWith('/storage/index.js') ? { getSettingsRepo: () => ({ [method]: async handle => { owners.push(handle); if (broken) throw new Error('Database secret'); return saved; } }) }
+                : specifier.endsWith('/secrets.js') ? { SECRET_KEYS: { MAKERSUITE: 'key' }, readSecret: () => '' } : { getGoogleApiConfig: async () => ({}) },
+        });
+        assert.equal(await runtime.readSavedSettings('alice'), saved); assert.deepEqual(owners, ['alice']);
+        await assert.rejects(runtime.readSavedSettings(undefined), { code: 'BRIDGE_FOLLOW_SETTINGS_UNAVAILABLE' }); assert.deepEqual(owners, ['alice']);
+        broken = true;
+        await assert.rejects(runtime.readSavedSettings('alice'), cause => cause.code === 'BRIDGE_FOLLOW_SETTINGS_UNAVAILABLE' && !cause.message.includes('Database secret'));
+    }
+});
+test('only absent Luker storage or SillyTavern uses file follow; existing broken storage stays authoritative', async () => {
+    for (const [name, exists, broken] of [['luker', false, false], ['sillytavern', true, false], ['luker', true, true]]) {
+        let storageImports = 0;
+        const runtime = await loadStRuntime({ readFile: async () => JSON.stringify({ name, version: name === 'luker' ? '2.7.0' : '1.18.0' }), fileExists: () => exists,
+            importModule: async specifier => {
+                if (specifier.endsWith('/storage/index.js')) { storageImports++; throw new Error('Storage dependency unavailable'); }
+                return specifier.endsWith('/secrets.js') ? { SECRET_KEYS: { MAKERSUITE: 'key' }, readSecret: () => '' } : { getGoogleApiConfig: async () => ({}) };
+            },
+        });
+        assert.equal(typeof runtime.readSavedSettings === 'function', broken);
+        assert.equal(storageImports, broken ? 1 : 0);
+        if (broken) await assert.rejects(runtime.readSavedSettings('alice'), { code: 'BRIDGE_FOLLOW_SETTINGS_UNAVAILABLE' });
+    }
 });

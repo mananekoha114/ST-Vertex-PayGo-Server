@@ -50,6 +50,7 @@ async function loadStRuntime({
     rootDir = process.cwd(),
     readFile = fs.promises.readFile,
     importModule = specifier => import(specifier),
+    fileExists = filename => fs.existsSync(filename),
 } = {}) {
     const resolvedRoot = path.resolve(rootDir);
     let packageData;
@@ -61,6 +62,28 @@ async function loadStRuntime({
 
     if (!isSupportedHost(packageData)) {
         throw new PluginError(500, 'INCOMPATIBLE_SILLYTAVERN', 'This plugin requires SillyTavern 1.16.0 or newer, or a compatible Luker runtime.');
+    }
+
+    // New Luker installations store authoritative settings in a repository,
+    // which may use a database. Existing repository failures must never cause
+    // the bridge to read an obsolete settings.json instead.
+    let readSavedSettings;
+    const storagePath = path.join(resolvedRoot, 'src', 'storage', 'index.js');
+    if (packageData.name === 'luker' && await fileExists(storagePath)) {
+        let storage;
+        try { storage = await importModule(pathToFileURL(storagePath).href); } catch { /* Report on follow, leaving independent features available. */ }
+        readSavedSettings = async ownerHandle => {
+            try {
+                if (typeof ownerHandle !== 'string' || !ownerHandle || ownerHandle.length > 256 || /[\x00-\x1f\x7f]/u.test(ownerHandle)) throw new Error('Missing authenticated settings owner');
+                if (typeof storage?.getSettingsRepo !== 'function') throw new Error('Missing settings repository');
+                const repo = storage.getSettingsRepo();
+                const read = typeof repo?.get === 'function' ? repo.get : repo?.load;
+                if (typeof read !== 'function') throw new Error('Missing repository reader');
+                return await read.call(repo, ownerHandle);
+            } catch {
+                throw new PluginError(409, 'BRIDGE_FOLLOW_SETTINGS_UNAVAILABLE', 'The saved main API settings could not be read from the host settings repository. Save the settings and retry.');
+            }
+        };
     }
 
     const googleModuleUrl = pathToFileURL(path.join(resolvedRoot, 'src', 'endpoints', 'google.js')).href;
@@ -232,6 +255,7 @@ async function loadStRuntime({
         getGoogleApiConfig,
         getOpenAIConfig,
         resolveOpenAIConnection,
+        ...(readSavedSettings ? { readSavedSettings } : {}),
     });
 }
 

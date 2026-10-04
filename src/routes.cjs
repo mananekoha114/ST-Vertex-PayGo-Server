@@ -40,6 +40,7 @@ function registerRoutes(router, dependencies) {
                 openaiBridge: Boolean(dependencies.openaiBridge),
                 openaiBridgeDebug: Boolean(dependencies.openaiBridge),
                 openaiBridgeLogs: Boolean(dependencies.openaiBridge),
+                openaiBridgeGateway: Boolean(dependencies.openaiBridge),
             },
         });
     });

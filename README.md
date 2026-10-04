@@ -13,12 +13,12 @@
 
 `feat/google-openai-bridge` 新增可选的本机 OpenAI 兼容入口，尚未发布。默认关闭，需配套同分支前端管理；仅支持 **SillyTavern / Luker，TauriTavern 不可用**。
 
-桥接只将 Chat Completions 请求转发到以下 Google 官方端点：
+桥接对外提供 Chat Completions 请求，默认转发到以下 Google 官方 OpenAI 兼容端点：
 
 - AI Studio：`https://generativelanguage.googleapis.com/v1beta/openai/chat/completions`，使用宿主保存的 Gemini API key。
 - Vertex AI：`https://{region}-aiplatform.googleapis.com/v1/projects/{project}/locations/{region}/endpoints/openapi/chat/completions`；`global` 使用 `aiplatform.googleapis.com`，由宿主保存的服务账号换取 OAuth access token。
 
-Vertex Express/API key 认证暂不支持。桥接不调用原生生成接口，不跟随 HTTP 重定向，不自动重试、换账号或回退其他协议。官方端点的使用不构成账号安全、免封或合规保证。
+Vertex 可选择 `mode: "gemini"` 网关，将 OpenAI 请求转换为同一绑定项目、区域和凭据下的原生 `generateContent` / `streamGenerateContent`，再将 Google JSON/SSE 转为 OpenAI JSON/SSE。AI Studio 保持原生 OpenAI 兼容转发，不提供网关或桥接层级策略。Vertex Express/API key 认证暂不支持。桥接不跟随 HTTP 重定向，不自动重试、换账号或失败回退其他协议。官方端点的使用不构成账号安全、免封或合规保证。
 
 ### 管理与调用
 
@@ -47,6 +47,12 @@ POST 请求示例（配置中没有 Google 凭据明文）：
 
 `secretId` 可选择宿主已保存的凭据。未指定时在启用阶段绑定当前凭据，不随主界面后续换号。`{"enabled": false}` 关闭并撤销访问；`{"enabled": true, "rotateKey": true}` 沿用已绑定连接并轮换桥接 key。
 
+Vertex 管理配置还接受 `mode: "openai" | "gemini"`、`tierSource: "independent" | "follow"`、`tier: "standard" | "flex" | "priority"`。初次启用默认 `openai`、`independent`、`standard`；后续省略字段保留已选策略。切换到 AI Studio 自动恢复默认策略。策略更新会取消正在进行的桥接请求。
+
+独立层级使用桥接保存的 `tier`。跟随主 API 时，每次请求读取当前登录用户在宿主中最近保存的设置：SillyTavern 或没有设置仓库的旧 Luker 使用用户目录的 `settings.json`；具备设置仓库的 Luker 使用绑定用户的可信账户 handle 从仓库读取，兼容文件、SQLite、MySQL、PostgreSQL 存储，仓库失败不回退陈旧文件。层级优先使用活动 Google 连接配置中的 `vertex-paygo` 状态，其次使用 `oai_settings.extensions['vertex-paygo']`；并要求已保存的 `main_api` 为 `openai`、来源为 `vertexai`。跟随仅同步层级及 PayGo-only，不改变桥接绑定的模型、区域或凭据。保存设置无法读取、超过 8 MiB、层级无效或来源不匹配均明确报错，不降级。界面状态返回 `effectiveTier`，读取失败时为 `null`，`tierError` 提供安全错误说明；此时仍可关闭或更改策略。
+
+Vertex Flex 仅在 Gemini 网关模式可用，原生 OpenAI 模式拒绝 Flex；Flex 和 Priority 都要求桥接绑定区域为 `global`，插件不会自动修改区域。服务器独立构造 PayGo 头，Flex 带 `X-Server-Timeout: 1800`，生成总期限为 30 分钟（普通请求与模型目录为 180 秒）。Vertex 外部请求中的 `service_tier`、`serviceTier` 字段会被拒绝，客户端不能覆盖桥接策略。具体模型与项目是否支持该层级由 Google 判断。
+
 管理状态包含 `debugLocalAccess`，默认 `false`。启用桥接时可一并提交该布尔值；已启用时用 `{"enabled": true, "debugLocalAccess": true}` 开启本机浏览器跨域调试，传 `false` 关闭。省略时保留原值，关闭桥接或重启后恢复关闭。调试设置更新同样会取消未完成请求。
 
 启用后，默认返回固定 Base URL `http://127.0.0.1:18443/openai/v1`。调用方使用独立桥接 key 作为 Bearer 凭据，调用 `GET /models` 或 `POST /chat/completions`。模型别名 `st-current` 表示**桥接绑定模型**，并非实时主聊天模型。调用者也可显式选择合法的 `gemini-*` 模型；Vertex 会添加 `google/` 前缀。
@@ -65,7 +71,7 @@ POST 请求示例（配置中没有 Google 凭据明文）：
 
 桥接启用后自动记录持有效桥接 key 的调用。前端“桥接 API 日志”可以手动刷新、展开查看和清空；日志读取及清空仅使用当前 ST/Luker 登录用户的目录，不向 Debug 浏览器开放。
 
-日志位置：`<当前用户目录>/vertex-paygo/openai-bridge-logs.json`。重启保留，最新请求在前；最多保留 50 条及 20 MiB，超过时淘汰最早记录。每个正文最多捕获 1 MiB，超过会标记截断。包含时间、路径、HTTP 状态、耗时、原始请求、模型名处理后的转发请求、客户端响应及错误；SSE 保留事件原文，模型发现另显示 Google 原始分页正文。中断与未接收完整的请求体有单独标记。
+日志位置：`<当前用户目录>/vertex-paygo/openai-bridge-logs.json`。重启保留，最新请求在前；最多保留 50 条及 20 MiB，超过时淘汰最早记录。每个正文最多捕获 1 MiB，超过会标记截断。包含时间、路径、HTTP 状态、耗时、原始请求、转发请求、客户端响应及错误；Gemini 网关中转发正文是原生 Gemini 格式，上游原始正文单独记录，客户端响应为 OpenAI 格式。SSE 保留相应事件原文，模型发现另显示 Google 原始分页正文。中断与未接收完整的请求体有单独标记。
 
 这些日志**包含提示词及模型输出**，与主聊天的无正文诊断日志不同。不记录认证头，已知桥接 key、实际使用的 Google token/key 及已持有的服务账号私钥会脱敏，包括按 ID 选择的凭据和捕获边界处的凭据片段。识别出 JSON 转义后的凭据时会省略整个正文字段；嵌套转义过深或末尾转义不完整时也会保守省略，并显示原因。普通正文保留原文；这不是通用敏感信息检测，正文里用户自行填写的其他敏感内容仍属于原文。无有效 key 的请求不能归属到用户，不写入用户日志。日志写入失败不会影响 API 调用；磁盘繁忙时待写队列有界（每用户 4 条、全局 16 条），超出会跳过记录，因此不是保证无遗漏的审计系统。
 
@@ -76,10 +82,10 @@ POST 请求示例（配置中没有 Google 凭据明文）：
 - AI Studio：`GET https://generativelanguage.googleapis.com/v1beta/openai/models`，使用绑定 key 的 Bearer 认证。
 - Vertex Full：`GET https://{regional-host}/v1beta1/publishers/google/models?view=PUBLISHER_MODEL_VIEW_FULL&listAllVersions=true&pageSize=100`，使用绑定服务账号的 OAuth；`global` 使用 `aiplatform.googleapis.com`，其他区域使用 `{region}-aiplatform.googleapis.com`。跟随 `nextPageToken` 遍历分页，不跟随任意上游 URL。
 - 仅返回合法 Gemini 模型名称，过滤 embedding、Live、原生音频、TTS 专用名称并去重；不把目录内部 `versionId` 拼成调用 ID。Vertex 返回 `google/gemini-*`，AI Studio 返回 `gemini-*`。
-- 目录不代表项目、区域或 Chat Completions 的调用权限保证。调用端可直接在 `model` 指定具体名称，实际支持由 Google 校验；生成仍只走官方 OpenAI Chat Completions。
+- 目录不代表项目、区域或生成接口的调用权限保证。调用端可直接在 `model` 指定具体名称，实际支持由 Google 校验；生成接口按桥接选择的模式固定。
 - 查询错误直接返回，不用静态列表掩盖失败。目录查询也受鉴权、取消、并发与总超时限制；最多读取 100 页、累计 8 MiB，超过限制明确报错，不返回截断名单。
 
-Vertex 仅对模型目录元数据整理成 OpenAI 列表格式，不转换任何生成请求或生成响应。参考：[AI Studio 模型发现](https://ai.google.dev/gemini-api/docs/openai#list_models)、[Vertex 官方模型目录](https://docs.cloud.google.com/gemini-enterprise-agent-platform/reference/rest/v1beta1/publishers.models/list)。
+模型目录路由不受网关模式或层级影响。参考：[AI Studio 模型发现](https://ai.google.dev/gemini-api/docs/openai#list_models)、[Vertex 官方模型目录](https://docs.cloud.google.com/gemini-enterprise-agent-platform/reference/rest/v1beta1/publishers.models/list)。
 
 ### 生命周期与隔离
 
