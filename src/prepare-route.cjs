@@ -144,6 +144,8 @@ function createPrepareHandler({ stRuntime, ticketStore, loopbackTransport, logSt
                 protocolVersion: PROTOCOL_VERSION,
                 pluginId: PLUGIN_ID,
                 transport: 'loopback-http',
+                nativeGemini4: true,
+                nativeGeminiApiVersion: new URL(targetUrl).pathname.split('/')[1],
                 ticket: issued.ticket,
                 proxySecret: issued.proxySecret,
                 proxyUrl,

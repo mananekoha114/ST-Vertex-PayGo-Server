@@ -305,6 +305,20 @@ async function loadStRuntime({
         }
     };
 
+    let nativeGeminiHelpers;
+    const getNativeGeminiHelpers = async () => {
+        if (!nativeGeminiHelpers) nativeGeminiHelpers = Promise.all([
+            importModule(pathToFileURL(path.join(resolvedRoot, 'src', 'prompt-converters.js')).href),
+            importModule(pathToFileURL(path.join(resolvedRoot, 'src', 'constants.js')).href),
+        ]).then(([converters, constants]) => {
+            if (typeof converters.postProcessPrompt !== 'function' || typeof converters.convertGooglePrompt !== 'function' || !Array.isArray(constants.GEMINI_SAFETY) || !Array.isArray(constants.VERTEX_SAFETY)) {
+                throw new Error('Missing native Gemini helpers');
+            }
+            return { postProcessPrompt: converters.postProcessPrompt, convertGooglePrompt: converters.convertGooglePrompt, GEMINI_SAFETY: constants.GEMINI_SAFETY, VERTEX_SAFETY: constants.VERTEX_SAFETY };
+        }).catch(() => { nativeGeminiHelpers = undefined; throw new PluginError(500, 'INCOMPATIBLE_SILLYTAVERN', 'The host native Gemini converter is unavailable.'); });
+        return nativeGeminiHelpers;
+    };
+
     return Object.freeze({
         rootDir: resolvedRoot,
         hostName: packageData.name,
@@ -314,6 +328,7 @@ async function loadStRuntime({
         resolveOpenAIConnection,
         listBridgeUsers,
         dataBackupContext,
+        getNativeGeminiHelpers,
         ...(readSavedSettings ? { readSavedSettings } : {}),
     });
 }

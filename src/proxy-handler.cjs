@@ -14,6 +14,7 @@ const { PluginError, sendNodeError } = require('./errors.cjs');
 const { describeError } = require('./log-store.cjs');
 const { validatePreparedGoogleTarget } = require('./target-policy.cjs');
 const { UsageCapture } = require('./usage-capture.cjs');
+const { isGemini4Argon, runGemini4Transport } = require('./gemini4-transport.cjs');
 
 const HOP_BY_HOP_HEADERS = new Set([
     'connection',
@@ -239,6 +240,23 @@ function createProxyHandler({
             // Revalidate the stored URL immediately before opening the socket. Tickets
             // only contain URLs produced by target-policy and cannot be client supplied.
             const target = validatePreparedGoogleTarget(ticketData.targetUrl, ticketData);
+
+            if (isGemini4Argon(ticketData.model)) {
+                let aggregateUsage;
+                usageCapture = { finish: () => aggregateUsage };
+                runGemini4Transport({
+                    request, response, ticketData, target, upstreamRequest,
+                    maxBodyBytes, upstreamTimeoutMs,
+                    onUsage: (usage, complete) => {
+                        aggregateUsage = usage;
+                        if (complete) {
+                            finalizeUsage(usage ? 'complete' : 'incomplete', usage ? undefined : 'USAGE_METADATA_MISSING', usage);
+                            logTerminal('info', 'proxy_completed', { statusCode: 200 });
+                        }
+                    },
+                }).catch(fail);
+                return;
+            }
 
             upstream = upstreamRequest(target, {
                 method: 'POST',

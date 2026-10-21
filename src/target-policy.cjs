@@ -32,7 +32,7 @@ function parseAndValidateGoogleTarget(rawUrl, { model, region, stream, source = 
     const expectedPath = aiStudio ? new RegExp(
         `^/v1(?:beta|alpha)?/models/${escapeRegularExpression(model)}:${endpoint}$`, 'u',
     ) : new RegExp(
-        `^/v1/(?:projects/[a-z0-9][a-z0-9-]{0,62}/locations/${escapeRegularExpression(region)}/)?publishers/google/models/${escapeRegularExpression(model)}:${endpoint}$`,
+        `^/${/^gemini-4-argon(?:-cyber-permissive)?$/u.test(model) && prepared ? 'v1(?:beta1)?' : 'v1'}/(?:projects/[a-z0-9][a-z0-9-]{0,62}/locations/${escapeRegularExpression(region)}/)?publishers/google/models/${escapeRegularExpression(model)}:${endpoint}$`,
         'u',
     );
 

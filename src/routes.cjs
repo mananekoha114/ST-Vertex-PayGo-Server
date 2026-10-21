@@ -18,6 +18,7 @@ const { createClientLogHandler, createReadLogsHandler } = require('./log-routes.
 const { createPrepareHandler } = require('./prepare-route.cjs');
 const { createUsageHandler } = require('./usage-route.cjs');
 const { registerDataBackupRoutes } = require('./data-backup-routes.cjs');
+const { createNativeGeminiHandler } = require('./native-gemini.cjs');
 const {
     createCheckUpdateHandler,
     createStartUpdateHandler,
@@ -43,6 +44,7 @@ function registerRoutes(router, dependencies) {
                 logs: isAdmin,
                 clientLogging: isAdmin,
                 usage: true,
+                nativeGemini4: Boolean(dependencies.loopbackTransport),
                 dataBackups: Boolean(dependencies.dataBackups),
                 // Absent means the backend predates the panel updater; false
                 // means the caller is not an administrator.
@@ -61,6 +63,12 @@ function registerRoutes(router, dependencies) {
     router.get('/update/status', createUpdateStatusHandler(dependencies));
     router.post('/logs/client', createClientLogHandler(dependencies));
     router.post('/prepare', createPrepareHandler(dependencies));
+    if (dependencies.loopbackTransport) {
+        router.post('/native-gemini/generate', createNativeGeminiHandler({
+            runtime: dependencies.stRuntime,
+            loopbackTransport: dependencies.loopbackTransport,
+        }));
+    }
     router.post('/update', createStartUpdateHandler(dependencies));
     if (dependencies.dataBackups) registerDataBackupRoutes(router, dependencies.dataBackups);
     if (dependencies.openaiBridge) {
