@@ -109,6 +109,11 @@ async function loadStRuntime({
     }
 
     const getGoogleApiConfig = async (request, model, endpoint) => {
+        // Match the host: a Studio reverse proxy owns its credentials, even
+        // when a saved profile also carries an explicit Google secret ID.
+        if (request?.body?.api === 'makersuite' && request.body.reverse_proxy) {
+            return googleModule.getGoogleApiConfig(request, model, endpoint);
+        }
         const rawSecretId = request?.body?.secret_id ?? request?.body?.secretId;
         const secretId = typeof rawSecretId === 'string' ? rawSecretId.trim() : '';
         if (!secretId) {

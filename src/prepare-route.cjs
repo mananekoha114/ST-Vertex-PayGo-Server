@@ -76,9 +76,12 @@ function createPrepareHandler({ stRuntime, ticketStore, loopbackTransport, logSt
             };
             if (config.expressProjectId) syntheticBody.vertexai_express_project_id = config.expressProjectId;
             if (config.secretId) syntheticBody.secret_id = config.secretId;
+            if (config.reverseProxy) {
+                syntheticBody.reverse_proxy = config.reverseProxy;
+                syntheticBody.proxy_password = config.proxyPassword;
+            }
 
-            // Deliberately synthesize a new object and never copy reverse_proxy or
-            // proxy_password from the browser-controlled prepare payload.
+            // Only the validated Studio proxy settings reach the host helper.
             const syntheticRequest = {
                 body: syntheticBody,
                 user: { directories: request.user.directories },
@@ -101,7 +104,9 @@ function createPrepareHandler({ stRuntime, ticketStore, loopbackTransport, logSt
             }
 
             const targetUrl = prepareGoogleTarget(googleConfig.url, config);
-            const headers = prepareGoogleHeaders(googleConfig.headers, buildPayGoHeaders(config));
+            const headers = prepareGoogleHeaders(googleConfig.headers, buildPayGoHeaders(config), {
+                allowUnauthenticated: Boolean(config.reverseProxy),
+            });
             if (request.aborted || response.destroyed) {
                 logStore?.server('warn', 'prepare_client_disconnected', prepareLogContext(config, startedAt));
                 ticketStore.release(reservation);
@@ -127,6 +132,7 @@ function createPrepareHandler({ stRuntime, ticketStore, loopbackTransport, logSt
                 targetUrl,
                 headers,
                 source: config.source,
+                ...(config.reverseProxy ? { reverseProxy: config.reverseProxy } : {}),
                 model: config.model,
                 stream: config.stream,
                 endpoint,
@@ -145,7 +151,9 @@ function createPrepareHandler({ stRuntime, ticketStore, loopbackTransport, logSt
                 pluginId: PLUGIN_ID,
                 transport: 'loopback-http',
                 nativeGemini4: true,
-                nativeGeminiApiVersion: new URL(targetUrl).pathname.split('/')[1],
+                nativeGeminiApiVersion: config.source === 'makersuite'
+                    ? new URL(targetUrl).pathname.match(/\/(v1(?:beta|alpha)?)\/models\/[^/]+$/u)[1]
+                    : new URL(targetUrl).pathname.split('/')[1],
                 ticket: issued.ticket,
                 proxySecret: issued.proxySecret,
                 proxyUrl,

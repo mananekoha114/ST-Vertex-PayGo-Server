@@ -12,7 +12,7 @@ const { PluginError } = require('./errors.cjs');
 
 const PROTOCOL_VERSION = 2;
 const PLUGIN_ID = 'vertex-paygo';
-const PLUGIN_VERSION = '0.5.1';
+const PLUGIN_VERSION = '0.6.0';
 const COMPATIBLE_ST_RANGE = '>=1.16.0';
 const TIERS = Object.freeze(['standard', 'flex', 'priority']);
 const AUTH_MODES = Object.freeze(['express', 'full']);
@@ -76,8 +76,27 @@ function validatePreparePayload(body) {
     if (!['vertexai', 'makersuite'].includes(source)) {
         throw new PluginError(400, 'GOOGLE_ONLY', 'Only the Vertex AI and Google AI Studio sources are supported.');
     }
-    if (Object.hasOwn(body, 'reverse_proxy') || Object.hasOwn(body, 'proxy_password')) {
+    if (source !== 'makersuite' && (Object.hasOwn(body, 'reverse_proxy') || Object.hasOwn(body, 'proxy_password'))) {
         throw new PluginError(400, 'UPSTREAM_PROXY_UNSUPPORTED', 'Existing reverse-proxy settings are not accepted by this transport.');
+    }
+    let reverseProxy;
+    let proxyPassword;
+    if (Object.hasOwn(body, 'reverse_proxy')) {
+        try {
+            if (typeof body.reverse_proxy !== 'string' || !body.reverse_proxy || body.reverse_proxy.length > 4096
+                || body.reverse_proxy.trim() !== body.reverse_proxy || /[\s\\]/u.test(body.reverse_proxy)) throw new Error();
+            const url = new URL(body.reverse_proxy);
+            if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) throw new Error();
+            reverseProxy = url.toString().replace(/\/+$/u, '');
+        } catch {
+            throw new PluginError(400, 'INVALID_REVERSE_PROXY', 'The AI Studio reverse proxy must be an HTTP(S) base URL without credentials, query or fragment.');
+        }
+        proxyPassword = body.proxy_password ?? '';
+        if (typeof proxyPassword !== 'string' || proxyPassword.length > 8192 || /[^\t\x20-\x7e\x80-\xff]/u.test(proxyPassword)) {
+            throw new PluginError(400, 'INVALID_PROXY_PASSWORD', 'The AI Studio proxy password is invalid.');
+        }
+    } else if (Object.hasOwn(body, 'proxy_password')) {
+        throw new PluginError(400, 'INVALID_REVERSE_PROXY', 'A proxy password requires an AI Studio reverse proxy URL.');
     }
 
     const model = requireCanonicalString(body.model, 'model', /^gemini-[a-z0-9][a-z0-9._-]*$/u);
@@ -118,6 +137,7 @@ function validatePreparePayload(body) {
     return Object.freeze({
         protocolVersion: PROTOCOL_VERSION,
         source,
+        ...(reverseProxy ? { reverseProxy, proxyPassword } : {}),
         model,
         region,
         authMode,

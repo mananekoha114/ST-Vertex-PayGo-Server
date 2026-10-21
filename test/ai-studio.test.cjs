@@ -25,7 +25,7 @@ test('AI Studio protocol accepts only Flex, independently of Vertex configuratio
     assert.equal(config.region, undefined);
     assert.equal(config.authMode, undefined);
     assert.equal(validatePreparePayload(prepareBody({ tier: 'standard' })).tier, 'standard');
-    for (const overrides of [{ tier: 'priority' }, { paygoOnly: true }, { model: 'gemma-3' }, { chat_completion_source: 'custom' }, { reverse_proxy: 'https://bad.invalid' }]) {
+    for (const overrides of [{ tier: 'priority' }, { paygoOnly: true }, { model: 'gemma-3' }, { chat_completion_source: 'custom' }, { reverse_proxy: 'file:///bad' }]) {
         assert.throws(() => validatePreparePayload(prepareBody(overrides)));
     }
     for (const url of [

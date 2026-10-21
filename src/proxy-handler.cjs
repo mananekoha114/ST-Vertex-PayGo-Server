@@ -9,6 +9,7 @@
 'use strict';
 
 const https = require('node:https');
+const http = require('node:http');
 const { Transform } = require('node:stream');
 const { PluginError, sendNodeError } = require('./errors.cjs');
 const { describeError } = require('./log-store.cjs');
@@ -115,9 +116,9 @@ function validateSuffix(parsed, modelAction, ticketData) {
         throw new PluginError(409, 'PROXY_REQUEST_MISMATCH', 'The proxy request does not match its ticket.');
     }
     const aiStudio = ticketData.source === 'makersuite';
-    const expectedSuffix = aiStudio ? new URL(ticketData.targetUrl).pathname
+    const expectedSuffix = aiStudio ? new URL(ticketData.targetUrl).pathname.match(/\/v1(?:beta|alpha)?\/models\/[^/]+$/u)?.[0]
         : `/v1/publishers/google/models/${ticketData.model}:${ticketData.endpoint}`;
-    if (!parsed.pathname.endsWith(expectedSuffix)) {
+    if (!expectedSuffix || !parsed.pathname.endsWith(expectedSuffix)) {
         throw new PluginError(409, 'PROXY_REQUEST_MISMATCH', 'The proxy provider or API version does not match its ticket.');
     }
     const keys = parsed.searchParams.getAll('key');
@@ -148,7 +149,7 @@ function createProxyHandler({
     ticketStore,
     logStore,
     usageStore,
-    upstreamRequest = https.request,
+    upstreamRequest = (target, options, callback) => (target.protocol === 'http:' ? http : https).request(target, options, callback),
     maxBodyBytes = 500 * 1024 * 1024,
     upstreamTimeoutMs = 31 * 60_000,
 } = {}) {

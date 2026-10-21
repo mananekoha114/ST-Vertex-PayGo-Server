@@ -11,7 +11,7 @@
 
 ## 0.5.0：Google OpenAI 兼容桥接
 
-当前配套版本为 **v0.5.1（2026-10-16）**。前端 v0.5.1 修复了准备失败被二次 CSRF 错误覆盖的问题，明确显示服务端错误码、消息及 HTTP 状态；本版本服务端保持协议 v2。
+当前配套版本为 **v0.6.0（2026-10-22）**，协议保持 v2。AI Studio 原生通道支持宿主 API 设置中的反向代理地址与代理密码，覆盖 Standard / Flex、流式与非流式以及 Gemini 4。支持 HTTP / HTTPS 和路径前缀（如 `https://proxy.example/gemini`），由宿主追加 API 版本与模型路径；代理启用时只使用代理密码，不读取 Google 官方密钥。Flex 要求上游支持 `service_tier: "flex"`。独立 OpenAI 兼容桥接仍使用下述官方端点。
 
 0.5.0（2026-10-14）提供可选的本机 OpenAI 兼容入口，需配套 0.5.0 前端管理；仅支持 **SillyTavern / Luker，TauriTavern 不支持桥接**。从旧版本升级后，桥接首次仍需用户手动启用；成功启用后会保存设置，并在后续宿主启动时自动恢复。没有保存配置的用户默认关闭。
 
@@ -123,7 +123,7 @@ SillyTavern 与 Luker 原生请求管道并未对外暴露 Google 专有的 PayG
 - **宿主程序**：SillyTavern ≥ 1.16.0 或 Luker ≥ 2.7.0（release 分支）
 - **运行环境**：Node.js ≥ 20
 - **前置依赖**：宿主内已配置可用的 Vertex AI（Express 快速密钥模式或 Service Account 服务账号均可）
-- **配套组件**：本插件与 `ST-Vertex-PayGo` 前端扩展均更新至 0.5.1（协议 v2），更新后重启酒馆并刷新前端页面
+- **配套组件**：本插件与 `ST-Vertex-PayGo` 前端扩展均更新至 0.6.0（协议 v2），更新后重启酒馆并刷新前端页面
 
 > 💡 **启动防御机制**：插件启动时会自动对宿主的 `package.json` 与 `src/endpoints/google.js` 进行静态完整性校验。若宿主版本过低或核心路由被第三方破坏，插件将主动终止初始化以防引发未定义崩溃。
 
@@ -248,7 +248,7 @@ Google AI Studio 的 Standard 与 Flex 模式复用相同的预检机制、鉴�
 - ❌ 非 Gemini 系列的模型（如 Vertex 内托管的 Claude、Llama、Mistral 等）。
 - ❌ 非 Google 官方接口（任何第三方中转/中继 API）。
 - ❌ 将 Flex / Priority 与具体区域节点（Regional Endpoints）混用。
-- ❌ 将现有的第三方反代 URL 强行接入本插件。
+- ❌ Vertex 自定义反代；AI Studio 原生通道支持宿主填写的反代地址与代理密码。
 - ❌ 将本插件的回环端口暴露给公网，作为多人共用的公开反代服务。
 
 ---
