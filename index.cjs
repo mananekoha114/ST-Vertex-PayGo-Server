@@ -16,9 +16,11 @@ const { BridgeStateStore } = require('./src/bridge-state-store.cjs');
 const { LogStore, describeError } = require('./src/log-store.cjs');
 const { PLUGIN_ID } = require('./src/protocol.cjs');
 const { registerRoutes } = require('./src/routes.cjs');
+const { createUpdater } = require('./src/updater/index.cjs');
 const { loadStRuntime } = require('./src/st-runtime.cjs');
 const { TicketStore } = require('./src/ticket-store.cjs');
 const { UsageStore } = require('./src/usage-store.cjs');
+const { createDataBackups } = require('./src/data-backups.cjs');
 
 const info = Object.freeze({
     id: PLUGIN_ID,
@@ -40,6 +42,12 @@ async function init(router) {
     const usageStore = new UsageStore();
     try {
         const stRuntime = await loadStRuntime();
+        const dataBackups = createDataBackups({ runtime: stRuntime, logStore });
+        // Apply queued restores before any PayGo listener or request handler
+        // can access the ledger or restore the persisted bridge configuration.
+        await dataBackups.initialize();
+        // Component paths and repositories remain lazy until an admin check.
+        const updater = createUpdater({ logStore, dataBackups });
         logStore.server('info', 'host_runtime_loaded', {
             hostName: stRuntime.hostName,
             hostVersion: stRuntime.stVersion,
@@ -62,7 +70,7 @@ async function init(router) {
             logStore.server('error', 'bridge_listener_failed', describeError(error));
             console.warn(`[Vertex PayGo] ${error.code}: ${error.message}`);
         }
-        registerRoutes(router, { stRuntime, ticketStore, loopbackTransport, logStore, usageStore, openaiBridge });
+        registerRoutes(router, { stRuntime, ticketStore, loopbackTransport, logStore, usageStore, openaiBridge, updater, dataBackups });
         activeState = { ticketStore, loopbackTransport, logStore, usageStore, openaiBridge, bridgeListener };
         logStore.server('info', 'plugin_ready', {
             hostName: stRuntime.hostName,

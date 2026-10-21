@@ -9,6 +9,7 @@
 'use strict';
 
 const { PluginError, sendExpressError } = require('./errors.cjs');
+const { requireAdministrator, requireAuthenticatedUser } = require('./admin-guard.cjs');
 const {
     CLIENT_LOG_MEDIA_TYPE,
     MAX_CLIENT_EVENT_BYTES,
@@ -16,24 +17,18 @@ const {
     validateClientLogEvent,
 } = require('./log-store.cjs');
 
-function requireAuthenticatedUser(request) {
-    if (!request.user || !request.user.directories) {
-        throw new PluginError(401, 'AUTHENTICATED_USER_REQUIRED', 'An authenticated SillyTavern user is required.');
-    }
-}
-
 function requireLogReader(request) {
-    requireAuthenticatedUser(request);
-    if (request.user.profile?.admin !== true) {
-        throw new PluginError(403, 'LOG_ACCESS_FORBIDDEN', 'Administrator access is required to read the shared server log.');
-    }
+    requireAdministrator(request, {
+        code: 'LOG_ACCESS_FORBIDDEN',
+        message: 'Administrator access is required to read the shared server log.',
+    });
 }
 
 function requireLogWriter(request) {
-    requireAuthenticatedUser(request);
-    if (request.user.profile?.admin !== true) {
-        throw new PluginError(403, 'CLIENT_LOG_ACCESS_FORBIDDEN', 'Administrator access is required to write the shared server log.');
-    }
+    requireAdministrator(request, {
+        code: 'CLIENT_LOG_ACCESS_FORBIDDEN',
+        message: 'Administrator access is required to write the shared server log.',
+    });
 }
 
 function discardRequestBody(request) {

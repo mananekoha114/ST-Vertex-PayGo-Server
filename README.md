@@ -198,6 +198,8 @@ Google AI Studio 的 Standard 与 Flex 模式复用相同的预检机制、鉴�
 
 账本以追加式 JSON Lines 存放在当前 SillyTavern 用户目录的 `vertex-paygo/usage-ledger.jsonl`，不会像运行日志一样在启动时清空，也不会为了写入新记录而重写全部历史。没有 `usageChatId` 的后台请求仍会正常代理，但不会建立无法查询的账本记录，`usageId` 返回 `null`。
 
+**数据恢复点**：插件启动、界面实际更新前及执行恢复前，会为有变化的用量账本和桥接配置保存本机快照，按宿主 `backups.common.numberOfBackups` 保留份数轮换。PayGo 面板中的“恢复数据”可选择当前用户的快照，确认后重启生效；恢复前保留原文件。快照包含当时的桥接开关与访问 key，应按敏感配置保管。它不是持续备份，不重复备份聊天、Google 凭据或日志；Luker 完整 ZIP 选择“设置”可带走快照，导回后再在 PayGo 中选择应用。限制、接口及失败恢复见[数据备份说明](docs/data-backups.md)。
+
 `GET /api/plugins/vertex-paygo/usage?chatId=...&limit=200&cursor=...` 只根据已认证用户自己的目录读取指定对话；`chatId` 本身不是访问凭据。每页默认 200 条、最多 500 条，存在后续页时返回 `nextCursor` 和 `truncated: true`。游标固定第一页看到的记录快照，因此翻页期间的新生成不会造成无限翻页。没有真实用户目录的匿名请求不能读取账本。
 
 记录状态为 `pending`、`complete`、`incomplete` 或 `failed`。只有捕获到有效 `usageMetadata` 才会标为 `complete`；缺失用量不会按 0 token 或 0 费用处理。新进程首次访问账本时会立即把上个进程遗留的 `pending` 记录持久化为 `incomplete`。非流响应使用增量 JSON 扫描，只保留顶层 `usageMetadata`；大型模型内容不会进入账本缓冲。单个超限 SSE 事件会被跳过，后续事件仍会继续检查。
@@ -270,6 +272,22 @@ Google AI Studio 的 Standard 与 Flex 模式复用相同的预检机制、鉴�
 
 ### Q: 无法调取或导出诊断日志？
 **A**: 日志端点设有访问控制，仅允许具备管理员权限的会话读取。请确保前端账号具有对应权限，且网络路径上的反向代理未拦截该接口。
+
+---
+
+## 面板内配套更新
+
+前端扩展面板可由管理员检查并执行前后端配套更新，效果与命令行更新入口一致：同一配套 tag、保留各自跟踪分支、保护本地修改、先下载校验再备份替换、不自动降级。不需要系统 Git、不需要 npm、不需要停宿主；替换后需重启宿主才能加载新版本，面板会明确提示这一点。
+
+| 方法 | 路径 | 用途 |
+| --- | --- | --- |
+| GET | `/api/plugins/vertex-paygo/update` | 检查两个组件并报告将要发生的变化，不写入任何安装目录 |
+| POST | `/api/plugins/vertex-paygo/update` | 开始更新，立即返回 `202`，替换在后台继续 |
+| GET | `/api/plugins/vertex-paygo/update/status` | 正在运行任务的阶段与上次结果 |
+
+三个接口都要求管理员会话，写操作另由宿主的 CSRF 中间件保护。`/health` 的 `capabilities.updater` 缺省表示后端版本过旧，`false` 表示当前会话不是管理员，`true` 表示面板可用。版本规则、事务与恢复边界见 [docs/in-app-updates.md](docs/in-app-updates.md)。
+
+宿主的 `enableServerPluginsAutoUpdate` 与 Luker 自带的扩展更新按钮是另外两条通道，本功能不修改它们；需要固定版本的用户应自行关闭宿主自动更新，否则宿主启动时可能把插件拉离配套 tag。
 
 ---
 

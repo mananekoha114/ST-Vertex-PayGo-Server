@@ -197,8 +197,8 @@ test('route registration exposes handshake, prepare, and fail-closed sink', () =
             server(level, event, context) { logEvents.push({ level, event, context }); },
         },
     });
-    assert.deepEqual(routes.get.map(route => route.path), ['/health', '/logs', '/usage']);
-    assert.deepEqual(routes.post.map(route => route.path), ['/logs/client', '/prepare']);
+    assert.deepEqual(routes.get.map(route => route.path), ['/health', '/logs', '/usage', '/update', '/update/status']);
+    assert.deepEqual(routes.post.map(route => route.path), ['/logs/client', '/prepare', '/update']);
     assert.deepEqual(routes.use.map(route => route.path), ['/rejected']);
 
     const response = {
@@ -212,7 +212,7 @@ test('route registration exposes handshake, prepare, and fail-closed sink', () =
     assert.equal(response.body.transport, 'loopback-http');
     assert.equal(response.body.pluginVersion, '0.5.1');
     assert.equal(response.body.sillyTavern.compatibleRange, '>=1.16.0');
-    assert.deepEqual(response.body.capabilities, { logs: true, clientLogging: true, usage: true, openaiBridge: false, openaiBridgeDebug: false, openaiBridgeLogs: false, openaiBridgeGateway: false, openaiBridgePersistence: false });
+    assert.deepEqual(response.body.capabilities, { logs: true, clientLogging: true, usage: true, dataBackups: false, updater: false, openaiBridge: false, openaiBridgeDebug: false, openaiBridgeLogs: false, openaiBridgeGateway: false, openaiBridgePersistence: false });
     assert.equal(Object.hasOwn(response.body, 'port'), false);
     assert.deepEqual(logEvents, []);
 
@@ -318,4 +318,35 @@ test('bridge user enumeration never falls back to a different user after host re
         });
         await assert.rejects(runtime.listBridgeUsers(), error => error.code === 'BRIDGE_USERS_UNAVAILABLE' && !error.message.includes('private'));
     }
+});
+
+test('data backups use all trusted accounts and the host retention configuration', async () => {
+    for (const enabled of [false, true]) {
+        const directory = require('node:path');
+        const runtime = await loadStRuntime({ rootDir: '/fake-host', fileExists: () => false,
+            readFile: async () => JSON.stringify({ name: 'luker', version: '2.8.0' }),
+            importModule: async specifier => {
+                if (specifier.endsWith('/users.js')) return { getAllUserHandles: async () => ['alice', 'disabled'],
+                    getUserDirectories: handle => ({ root: directory.resolve('data', handle), backups: directory.resolve('data', handle, 'backups') }) };
+                if (specifier.endsWith('/util.js')) return { getConfigValue: key => key === 'enableUserAccounts' ? enabled : 3 };
+                if (specifier.endsWith('/constants.js')) return { DEFAULT_USER: { handle: 'default-user' } };
+                if (specifier.endsWith('/secrets.js')) return { SECRET_KEYS: {}, readSecret() {} };
+                return { getGoogleApiConfig() {} };
+            },
+        });
+        const context = await runtime.dataBackupContext();
+        assert.equal(context.retention, 3);
+        assert.deepEqual(context.users.map(user => user.user.profile.handle), enabled ? ['alice', 'disabled'] : ['default-user']);
+    }
+});
+
+test('data backup routes and capability are installed together', () => {
+    const routes = { get: [], post: [] };
+    const router = { get(p, h) { routes.get.push([p, h]); }, post(p, h) { routes.post.push([p, h]); }, use() {} };
+    registerRoutes(router, { stRuntime: { stVersion: '2.8.0' }, dataBackups: {} });
+    assert.deepEqual(routes.get.map(([p]) => p), ['/health', '/logs', '/usage', '/update', '/update/status', '/data-backups']);
+    assert.deepEqual(routes.post.map(([p]) => p), ['/logs/client', '/prepare', '/update', '/data-restore', '/data-restore/cancel']);
+    const response = { set() {}, json(body) { this.body = body; } };
+    routes.get[0][1]({ user: {} }, response);
+    assert.equal(response.body.capabilities.dataBackups, true);
 });

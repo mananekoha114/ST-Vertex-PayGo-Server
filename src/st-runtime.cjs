@@ -278,6 +278,33 @@ async function loadStRuntime({
         }
     };
 
+    const dataBackupContext = async () => {
+        try {
+            const [users, util, constants] = await Promise.all([
+                importModule(pathToFileURL(path.join(resolvedRoot, 'src', 'users.js')).href),
+                importModule(pathToFileURL(path.join(resolvedRoot, 'src', 'util.js')).href),
+                importModule(pathToFileURL(path.join(resolvedRoot, 'src', 'constants.js')).href),
+            ]);
+            if (typeof users.getAllUserHandles !== 'function' || typeof users.getUserDirectories !== 'function'
+                || typeof util.getConfigValue !== 'function') throw new Error('Missing backup host helpers');
+            const enabled = util.getConfigValue('enableUserAccounts', false, 'boolean');
+            if (typeof enabled !== 'boolean') throw new Error('Invalid account configuration');
+            const handles = enabled ? await users.getAllUserHandles() : [constants.DEFAULT_USER?.handle];
+            if (!Array.isArray(handles) || new Set(handles).size !== handles.length) throw new Error('Invalid user registry');
+            return {
+                retention: util.getConfigValue('backups.common.numberOfBackups', 50, 'number'),
+                users: handles.map(handle => {
+                    if (typeof handle !== 'string' || !handle || handle.length > 256 || /[\\/\x00-\x1f\x7f]/u.test(handle)) throw new Error('Invalid user handle');
+                    const directories = users.getUserDirectories(handle);
+                    if (!path.isAbsolute(directories?.root ?? '') || !path.isAbsolute(directories?.backups ?? '')) throw new Error('Invalid user directory');
+                    return { user: { profile: { handle }, directories: { ...directories } } };
+                }),
+            };
+        } catch {
+            throw new PluginError(503, 'DATA_BACKUP_HOST_UNAVAILABLE', 'The host user directories or backup configuration could not be read.');
+        }
+    };
+
     return Object.freeze({
         rootDir: resolvedRoot,
         hostName: packageData.name,
@@ -286,6 +313,7 @@ async function loadStRuntime({
         getOpenAIConfig,
         resolveOpenAIConnection,
         listBridgeUsers,
+        dataBackupContext,
         ...(readSavedSettings ? { readSavedSettings } : {}),
     });
 }

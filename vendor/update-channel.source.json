@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "component": "st-vertex-paygo",
+  "path": "scripts/update-channel.cjs",
+  "commit": "61bf0080e66fd802867d782edfb905fb4fcad5e9",
+  "sha256": "d67f44239b93430d9d2fc2b620034860abcc73737e6a584d5f43a9a4f0688c7e"
+}
