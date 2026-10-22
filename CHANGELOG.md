@@ -1,5 +1,12 @@
 # 更新日志
 
+## 未发布 · 前后端独立更新
+
+- 面板内更新器不再要求前后端 tag 同名，两个组件各自跟随自己的跟踪分支与发布 tag。
+- 组件缺失、不是 Git 检出、有本地修改或下载失败时，只把该组件报告为 `missing` / `blocked`（附 `code` 与 `reason`），另一个组件照常检查和更新；检查结果新增 `partial` 字段。全部组件都不能更新时仍以 `UPDATER_COMPONENT_BLOCKED` 失败且不替换任何文件。
+- 新增协议守卫：比较两个组件更新后的 `PROTOCOL_VERSION`，暂缓会让两者不一致的一侧（`UPDATER_PROTOCOL_MISMATCH`），避免前端判定后端不可用、无法再通过面板修复。规则与前端命令行安装器一致，详见 [docs/in-app-updates.md](docs/in-app-updates.md#protocol-guard)。
+- 移除 `UPDATER_TAG_MISMATCH`。
+
 ## 0.6.0-hotfix1 · 2026-10-22 · 前端热修复配套版本
 
 - 与前端 `v0.6.0-hotfix1` 配套发布，后端代码与 0.6.0 相同，协议保持 v2。安装器要求前后端选中同名 tag，因此需要这个配套 tag。

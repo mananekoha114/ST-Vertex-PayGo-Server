@@ -185,6 +185,19 @@ function createGitOperations({ loadBundle = loadVendoredGit, fsModule = fs } = {
         }
     }
 
+    // Reads one file of a staged revision without checking it out; null when
+    // that revision does not contain the file.
+    async function readFileAt({ directory, oid, filepath }) {
+        const { git } = loadBundle();
+        try {
+            const { blob } = await git.readBlob({ fs: fsModule, dir: directory, oid, filepath, cache: freshCache() });
+            return Buffer.from(blob).toString('utf8');
+        } catch (error) {
+            if (isNotFound(error)) return null;
+            throw gitFailure('staged file read', error);
+        }
+    }
+
     async function isAncestor({ directory, older, newer }) {
         const { git } = loadBundle();
         if (older === newer) return true;
@@ -204,6 +217,7 @@ function createGitOperations({ loadBundle = loadVendoredGit, fsModule = fs } = {
         isAncestor,
         listRemoteTags,
         materialize,
+        readFileAt,
         readInstallation,
         readMetadata,
         readRemoteUrl,

@@ -1,9 +1,14 @@
 # In-app component updates
 
-The frontend panel can update both PayGo components without a terminal. The
+The frontend panel can update the PayGo components without a terminal. The
 rules it follows are the command-line installer's, so a panel update and a CLI
-update reach the same release; what differs is the environment, because the
+update reach the same releases; what differs is the environment, because the
 panel works inside a running host, without system Git and without npm.
+
+The two components update independently. Each follows its own channel and
+release tags, and a component that is missing or blocked does not stop the
+other. The one thing they must share is the wire protocol, which the protocol
+guard below protects.
 
 ## Why the panel needs its own implementation
 
@@ -43,7 +48,7 @@ commands when installing the plugin.
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| GET | `/api/plugins/vertex-paygo/update` | Check both components and report what would change. |
+| GET | `/api/plugins/vertex-paygo/update` | Check each component and report what would change. |
 | POST | `/api/plugins/vertex-paygo/update` | Start the update. Answers `202` and keeps working in the background. |
 | GET | `/api/plugins/vertex-paygo/update/status` | The running job's phase and the last outcome. |
 
@@ -75,8 +80,31 @@ The policy follows `scripts/install.mjs`:
 - Tracked changes, new untracked files, commits absent from the remote history, and a selected
   release older than the installed revision all stop the update. An installed
   revision that is ahead of the newest tag is kept, never downgraded.
-- When both components follow tags, their selected tags must match. If either
-  component is blocked the whole update stops before activation.
+- Each component selects its own target; the two release tags need not have
+  the same name.
+- A component that cannot be planned (missing, ambiguous, not a Git checkout,
+  local changes, a failed download) is reported with a `status`, `code` and
+  `reason`, and the other component is still planned and updated. The check
+  reports `partial: true` when one component can update while the other cannot.
+  An update starts only if at least one component changes; when every component
+  is blocked it fails with `UPDATER_COMPONENT_BLOCKED` and nothing is replaced.
+
+## Protocol guard
+
+The extension refuses a server whose `protocolVersion` differs from its own, and
+that refusal also hides this panel, so a mismatched pair could not be repaired
+from here. Before anything is prepared, the updater therefore compares the
+`PROTOCOL_VERSION` each component would end up with: the frontend's
+`src/constants.js` and the server's `src/protocol.cjs`, read from the staged
+target revision with `readBlob` or from the installed copy.
+
+It applies the largest set of pending updates that keeps one protocol version:
+both updates, then either one alone, then none. An update left out is reported
+as `blocked` with code `UPDATER_PROTOCOL_MISMATCH`. A version that cannot be read
+never constrains, and an installation that is already mismatched may still
+update, because updating is the only way out of it. The command-line installer
+applies the same rule (`holdBackIncompatible` in `scripts/install.mjs`), so the
+two must change together.
 
 Native Git comparison tests cover merge history, candidate limits and same-commit
 tag ordering. They require Git only on the development machine; runtime selection
@@ -104,7 +132,7 @@ file. Components must not overlap each other or the code-backup directory.
 Components inside a data root, as used by APKs and per-user extensions, are valid.
 The layout is checked again before replacement.
 
-1. Take the installer's lock, check both components and clone the target revisions into a staging
+1. Take the installer's lock, check each component and clone the target revisions into a staging
    directory, still without touching an installation.
 2. Verify each prepared copy is the component it claims to be, still has its
    entry point, and contains no symlink.
@@ -144,8 +172,8 @@ it does not demonstrate Android APK crash recovery.
 - **The host has its own update channels.** Upstream SillyTavern and Luker both
   pull plugin repositories at startup when `enableServerPluginsAutoUpdate` is
   enabled (default `true`), and Luker additionally offers an extension update
-  button. Those paths do not understand the paired-tag release and can move a
-  component to `main` independently. The panel reports the situation but never
+  button. Those paths do not apply the channel rules or the protocol guard and
+  can move a component to `main` on their own. The panel reports the situation but never
   edits the host configuration; pinning a release means disabling that setting.
 - **Windows and macOS activation are untested.** On Windows an open handle can
   make a rename fail; the failure is reported and rollback is attempted.

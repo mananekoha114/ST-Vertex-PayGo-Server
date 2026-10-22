@@ -21,6 +21,7 @@ const {
     serverDirectory,
 } = require('./locations.cjs');
 const transaction = require('./transaction.cjs');
+const { PROTOCOL_FILES, holdBackIncompatible, parseProtocolVersion } = require('./compatibility.cjs');
 const {
     ACTION_UPDATE,
     inferChannel,
@@ -28,13 +29,20 @@ const {
     selectReleaseTag,
 } = require('./version-policy.cjs');
 
-// Orchestration: decide what both components should become, prepare them both,
-// and only then touch the installed copies.
+// Orchestration: decide what each component should become, prepare the ones
+// that change, and only then touch the installed copies.
+//
+// The components update independently: each follows its own channel and
+// release tags, and one that is missing or blocked does not stop the other.
+// Only an update that would leave them on different protocol versions is held
+// back (see compatibility.cjs).
 //
 // A check never writes to an installation. Everything a check learns comes from
 // a staged clone that is removed again, so a failed check cannot leave a
 // half-updated host. The panel asks for a check only when the administrator
 // clicks, so no polling happens behind the user's back.
+
+const ACTIVE_STATUSES = Object.freeze(['update', 'unchanged', 'keep-ahead']);
 
 const COMPONENTS = Object.freeze([
     Object.freeze({ name: 'frontend', label: 'frontend extension', remote: OFFICIAL_REMOTES.frontend }),
@@ -175,26 +183,88 @@ function createUpdater({
         };
     }
 
+    // A component that cannot be planned is reported, not thrown, so that the
+    // other component can still be checked and updated.
+    function blockedComponent(component, error) {
+        return {
+            name: component.name,
+            label: component.label,
+            directory: component.directory ?? null,
+            originMismatch: false,
+            status: error?.code === 'UPDATER_COMPONENT_MISSING' ? 'missing' : 'blocked',
+            code: error?.code ?? 'UPDATER_COMPONENT_BLOCKED',
+            reason: error?.message ?? String(error),
+        };
+    }
+
+    function readInstalledProtocol(component) {
+        try {
+            return parseProtocolVersion(fs.readFileSync(path.join(component.directory, PROTOCOL_FILES[component.name]), 'utf8'));
+        } catch {
+            return null;
+        }
+    }
+
+    async function guardProtocol(planned) {
+        const entries = [];
+        for (const component of planned) {
+            const changing = component.status === ACTION_UPDATE;
+            entries.push({
+                name: component.name,
+                changing,
+                installed: ACTIVE_STATUSES.includes(component.status) ? readInstalledProtocol(component) : null,
+                target: changing
+                    ? parseProtocolVersion(await gitOperations.readFileAt({
+                        directory: component.staged, oid: component.target.commit, filepath: PROTOCOL_FILES[component.name],
+                    }))
+                    : null,
+            });
+        }
+        const held = holdBackIncompatible(entries);
+        return planned.map(component => {
+            const conflict = held.get(component.name);
+            if (!conflict) return component;
+            const other = planned.find(item => item.name === conflict.other);
+            return {
+                ...component,
+                status: 'blocked',
+                code: 'UPDATER_PROTOCOL_MISMATCH',
+                reason: `Updating the ${component.label} would require protocol v${conflict.protocol}, `
+                    + `but the ${other.label} stays on v${conflict.otherProtocol}. Update the ${other.label} as well, or wait for a compatible release.`,
+            };
+        });
+    }
+
     async function planAll(resolved) {
-        const located = COMPONENTS.map(component => ({ ...component, directory: locate(component, resolved) }));
-        assertSafeLayout(resolved, located.map(component => component.directory), path.join(resolved.updateRoot, transaction.BACKUP_ROOT));
+        const located = COMPONENTS.map(component => {
+            try {
+                return { ...component, directory: locate(component, resolved) };
+            } catch (error) {
+                return { ...component, directory: null, locateError: error };
+            }
+        });
+        assertSafeLayout(resolved, located.filter(component => component.directory).map(component => component.directory),
+            path.join(resolved.updateRoot, transaction.BACKUP_ROOT));
         const staging = transaction.createStaging(resolved.updateRoot);
         try {
             const planned = [];
             for (const component of located) {
-                const entries = await gitOperations.listRemoteTags(component.remote);
-                const namesByCommit = new Map();
-                for (const entry of entries) {
-                    namesByCommit.set(entry.commit, [...(namesByCommit.get(entry.commit) ?? []), entry.name]);
+                if (component.locateError) {
+                    planned.push(blockedComponent(component, component.locateError));
+                    continue;
                 }
-                planned.push(await planComponent(component, staging, { entries, namesByCommit }));
+                try {
+                    const entries = await gitOperations.listRemoteTags(component.remote);
+                    const namesByCommit = new Map();
+                    for (const entry of entries) {
+                        namesByCommit.set(entry.commit, [...(namesByCommit.get(entry.commit) ?? []), entry.name]);
+                    }
+                    planned.push(await planComponent(component, staging, { entries, namesByCommit }));
+                } catch (error) {
+                    planned.push(blockedComponent(component, error));
+                }
             }
-            const tagged = planned.filter(component => component.channel?.mode === 'tag');
-            if (tagged.length === 2 && tagged[0].target.tag !== tagged[1].target.tag) {
-                throw new PluginError(409, 'UPDATER_TAG_MISMATCH',
-                    `Frontend/server tags are not aligned (${tagged[0].target.tag} / ${tagged[1].target.tag}). Wait for matching tags.`);
-            }
-            return { staging, components: planned };
+            return { staging, components: await guardProtocol(planned) };
         } catch (error) {
             transaction.removePath(staging);
             throw error;
@@ -202,11 +272,12 @@ function createUpdater({
     }
 
     function summarise(components) {
-        const blocked = components.filter(component => !['update', 'unchanged', 'keep-ahead'].includes(component.status));
+        const blocked = components.filter(component => !ACTIVE_STATUSES.includes(component.status));
         const updatable = components.filter(component => component.status === ACTION_UPDATE);
         return {
-            status: blocked.length > 0 ? 'blocked' : updatable.length > 0 ? 'update-available' : 'up-to-date',
+            status: updatable.length > 0 ? 'update-available' : blocked.length > 0 ? 'blocked' : 'up-to-date',
             upToDate: updatable.length === 0 && blocked.length === 0,
+            partial: updatable.length > 0 && blocked.length > 0,
         };
     }
 
@@ -224,6 +295,7 @@ function createUpdater({
             name: component.name,
             label: component.label,
             status: component.status,
+            code: component.code ?? null,
             reason: component.reason ?? null,
             originMismatch: component.originMismatch === true,
             channel: component.channel ?? null,
@@ -267,19 +339,18 @@ function createUpdater({
             const resolved = directories();
             lock = transaction.acquireLock(resolved.updateRoot);
             plan = await planAll(resolved);
-            // The two components ship as one release. Updating only the half that
-            // happens to be updatable would leave a host running mismatched
-            // versions, so a blocked component stops the whole update, exactly as
-            // the command-line installer stops when a component is missing.
-            const blocked = plan.components.filter(component => !['update', 'unchanged', 'keep-ahead'].includes(component.status));
-            if (blocked.length > 0) {
+            // Components update independently: a blocked one is reported in the
+            // result while the other proceeds. The protocol guard already held
+            // back any update that would break the pair.
+            const blocked = plan.components.filter(component => !ACTIVE_STATUSES.includes(component.status));
+            const changing = plan.components.filter(component => component.status === ACTION_UPDATE);
+            if (changing.length === 0 && blocked.length > 0) {
                 throw new PluginError(
                     409,
                     'UPDATER_COMPONENT_BLOCKED',
                     `The update was not started: ${blocked.map(component => `${component.label}: ${component.reason ?? component.status}`).join(' ')}`,
                 );
             }
-            const changing = plan.components.filter(component => component.status === ACTION_UPDATE);
             if (changing.length === 0) {
                 lastResult = {
                     status: 'no-change',
@@ -303,7 +374,8 @@ function createUpdater({
             }
 
             job.phase = 'activating';
-            for (const component of plan.components) {
+            // Recheck every component the protocol decision relied on.
+            for (const component of plan.components.filter(item => ACTIVE_STATUSES.includes(item.status))) {
                 const directory = locate(component, resolved);
                 const current = await gitOperations.readInstallation(directory);
                 if (directory !== component.directory || !current.isRepository || current.dirtyTrackedCount > 0
@@ -318,7 +390,8 @@ function createUpdater({
                 target: component.directory,
                 staged: component.staged,
             }));
-            assertSafeLayout(resolved, plan.components.map(component => component.directory), path.join(resolved.updateRoot, transaction.BACKUP_ROOT));
+            assertSafeLayout(resolved, plan.components.filter(component => component.directory).map(component => component.directory),
+                path.join(resolved.updateRoot, transaction.BACKUP_ROOT));
             await dataBackups?.beforeUpdate();
             const backup = transaction.createBackup(resolved.updateRoot, entries);
             transaction.activate({ rootDir: resolved.updateRoot, backup, entries });
@@ -331,6 +404,7 @@ function createUpdater({
                 finishedAt: now().toISOString(),
                 backup,
                 restartRequired: true,
+                partial: blocked.length > 0,
                 components,
             };
             note('info', 'updater_updated', { components: changing.map(component => component.name).join(',') });

@@ -44,6 +44,13 @@ test('the bundled Git distinguishes branch checkouts, detached tags and ancestry
     await assert.rejects(operations.materialize({ directory, oid: first, branch: 'dev' }), error => error.code === 'UPDATER_GIT_FAILED');
 });
 
+test('a staged revision file is read without a checkout', async t => {
+    const { directory, first, last, operations } = await repository(t);
+    assert.equal(await operations.readFileAt({ directory, oid: first, filepath: 'index.js' }), 'old\n');
+    assert.equal(await operations.readFileAt({ directory, oid: last, filepath: 'index.js' }), 'new\n');
+    assert.equal(await operations.readFileAt({ directory, oid: last, filepath: 'src/missing.js' }), null);
+});
+
 test('new untracked and staged files block replacement while ignored files do not', async t => {
     const { directory, git, operations } = await repository(t);
     fs.writeFileSync(path.join(directory, 'ignored.txt'), 'ignored\n');

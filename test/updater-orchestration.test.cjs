@@ -56,7 +56,7 @@ function makeHost() {
 // A Git port with no network and no repository: the two things an update must
 // learn from Git are supplied directly, and materialize writes the payload a
 // real checkout would have produced.
-function makeGitOperations({ frontendState, serverState }) {
+function makeGitOperations({ frontendState, serverState, targetProtocols = {} }) {
     const states = new Map([[frontendState.directory, frontendState], [serverState.directory, serverState]]);
     return {
         async listRemoteTags(url) {
@@ -82,6 +82,11 @@ function makeGitOperations({ frontendState, serverState }) {
                 writeJson(path.join(directory, 'package.json'), { name: 'st-vertex-paygo-server', main: 'index.cjs' });
                 writeText(path.join(directory, 'index.cjs'), 'new server\n');
             }
+        },
+        // Protocol versions of the staged target revisions; null when unknown.
+        async readFileAt({ directory }) {
+            const protocol = targetProtocols[path.basename(directory)];
+            return protocol === undefined ? null : `export const PROTOCOL_VERSION = ${protocol};\n`;
         },
         writeMetadata(directory, record) {
             writeJson(path.join(directory, '.git', 'paygo-updater.json'), { schema: 1, ...record });
@@ -217,28 +222,45 @@ test('a job keeps one host directory snapshot throughout preparation and activat
     assert.equal(reads, 1);
 });
 
-test('a blocked component stops the whole update instead of shipping half a release', async () => {
+test('a blocked component is reported while the other one still updates', async () => {
     const host = makeHost();
     try {
         const updater = makeUpdater(host, {
             frontendState: installation(host.frontend, { head: null, metadata: null, remote: null, isRepository: false }),
         });
         const report = await updater.check();
-        assert.equal(report.status, 'blocked');
+        assert.equal(report.status, 'update-available');
+        assert.equal(report.partial, true);
         assert.equal(report.components[0].status, 'not-a-repository');
         assert.match(report.components[0].reason, /not a Git checkout/u);
+        assert.equal(report.components[1].status, 'update');
 
-        // The job runs in the background, so a refusal is recorded as its
-        // outcome rather than thrown at the caller that started it.
         const result = await updater.start();
-        assert.equal(result.status, 'failed');
-        assert.equal(result.code, 'UPDATER_COMPONENT_BLOCKED');
-        assert.match(result.message, /not a Git checkout/u);
-        assert.equal(fs.readFileSync(path.join(host.server, 'index.cjs'), 'utf8'), 'old server\n');
-        assert.equal(fs.existsSync(path.join(host.root, '.paygo-install-backups')), false);
+        assert.equal(result.status, 'updated');
+        assert.equal(result.partial, true);
+        assert.deepEqual(result.components.map(component => component.status), ['not-a-repository', 'updated']);
+        assert.equal(fs.readFileSync(path.join(host.frontend, 'index.js'), 'utf8'), 'old frontend\n');
+        assert.equal(fs.readFileSync(path.join(host.server, 'index.cjs'), 'utf8'), 'new server\n');
     } finally {
         fs.rmSync(host.root, { recursive: true, force: true });
     }
+});
+
+test('nothing is replaced when every component is blocked', async t => {
+    const host = makeHost();
+    t.after(() => fs.rmSync(host.root, { recursive: true, force: true }));
+    const updater = makeUpdater(host, {
+        frontendState: installation(host.frontend, { head: null, metadata: null, remote: null, isRepository: false }),
+        serverState: installation(host.server, { head: SERVER_TIP, metadata: null, remote: SERVER_REMOTE, dirtyTrackedCount: 1 }),
+    });
+    assert.equal((await updater.check()).status, 'blocked');
+    // The job runs in the background, so a refusal is recorded as its outcome
+    // rather than thrown at the caller that started it.
+    const result = await updater.start();
+    assert.equal(result.status, 'failed');
+    assert.equal(result.code, 'UPDATER_COMPONENT_BLOCKED');
+    assert.match(result.message, /not a Git checkout/u);
+    assert.equal(fs.existsSync(path.join(host.root, '.paygo-install-backups')), false);
 });
 
 test('an installation already on the selected release is left alone', async () => {
@@ -287,17 +309,18 @@ test('a copy installed from a different origin is reported but still updated fro
     }
 });
 
-test('asynchronous ancestry rejects a local-only revision before replacing either component', async t => {
+test('asynchronous ancestry rejects a local-only revision of that component only', async t => {
     const host = makeHost();
     t.after(() => fs.rmSync(host.root, { recursive: true, force: true }));
     const updater = makeUpdater(host, {
         frontendState: installation(host.frontend, { head: 'e'.repeat(40), remote: FRONTEND_REMOTE }),
     });
-    await assert.rejects(updater.check(), error => error.code === 'UPDATER_LOCAL_COMMITS');
-    assert.equal((await updater.start()).code, 'UPDATER_LOCAL_COMMITS');
+    const report = await updater.check();
+    assert.equal(report.components[0].status, 'blocked');
+    assert.equal(report.components[0].code, 'UPDATER_LOCAL_COMMITS');
+    assert.equal((await updater.start()).status, 'updated');
     assert.equal(fs.readFileSync(path.join(host.frontend, 'index.js'), 'utf8'), 'old frontend\n');
-    assert.equal(fs.readFileSync(path.join(host.server, 'index.cjs'), 'utf8'), 'old server\n');
-    assert.equal(fs.existsSync(path.join(host.root, '.paygo-install-backups')), false);
+    assert.equal(fs.readFileSync(path.join(host.server, 'index.cjs'), 'utf8'), 'new server\n');
 });
 
 test('main installations ahead of the latest tags are kept even without metadata', async t => {
@@ -335,7 +358,7 @@ test('main metadata in commit mode still plans the release tag, not unreleased c
     assert.deepEqual(report.components.map(c => c.target.commit), [FRONTEND_OLD, SERVER_OLD]);
 });
 
-test('different release tags refuse the pair before activation', async t => {
+test('each component follows its own release tag', async t => {
     const host = makeHost();
     t.after(() => fs.rmSync(host.root, { recursive: true, force: true }));
     const updater = makeUpdater(host, {}, {
@@ -343,9 +366,47 @@ test('different release tags refuse the pair before activation', async t => {
             return [{ name: url === FRONTEND_REMOTE ? 'v0.5.1' : 'v0.5.0', commit: url === FRONTEND_REMOTE ? FRONTEND_TIP : SERVER_TIP }];
         },
     });
-    await assert.rejects(updater.check(), error => error.code === 'UPDATER_TAG_MISMATCH');
-    assert.equal((await updater.start()).code, 'UPDATER_TAG_MISMATCH');
-    assert.equal(fs.existsSync(path.join(host.root, '.paygo-install-backups')), false);
+    const report = await updater.check();
+    assert.equal(report.status, 'update-available');
+    assert.deepEqual(report.components.map(component => component.target.tag), ['v0.5.1', 'v0.5.0']);
+    assert.equal((await updater.start()).status, 'updated');
+});
+
+test('an update that would split the protocol versions is held back', async t => {
+    const host = makeHost();
+    t.after(() => fs.rmSync(host.root, { recursive: true, force: true }));
+    writeText(path.join(host.frontend, 'src', 'constants.js'), 'export const PROTOCOL_VERSION = 2;\n');
+    writeText(path.join(host.server, 'src', 'protocol.cjs'), 'const PROTOCOL_VERSION = 2;\n');
+    const serverCurrent = installation(host.server, { head: SERVER_TIP, remote: SERVER_REMOTE, branch: null,
+        metadata: { schema: 1, branch: 'main', mode: 'tag', tag: 'v0.5.0', commit: SERVER_TIP } });
+
+    // The frontend needs protocol v3, but the server has no newer release.
+    const alone = makeUpdater(host, { serverState: serverCurrent, targetProtocols: { frontend: 3 } });
+    const report = await alone.check();
+    assert.equal(report.status, 'blocked');
+    assert.equal(report.components[0].code, 'UPDATER_PROTOCOL_MISMATCH');
+    assert.match(report.components[0].reason, /protocol v3.*server plugin stays on v2/u);
+    assert.equal(report.components[1].status, 'unchanged');
+    assert.equal((await alone.start()).code, 'UPDATER_COMPONENT_BLOCKED');
+    assert.equal(fs.readFileSync(path.join(host.frontend, 'index.js'), 'utf8'), 'old frontend\n');
+
+    // A server release on the same protocol lets both move together.
+    const together = makeUpdater(host, { targetProtocols: { frontend: 3, server: 3 } });
+    assert.deepEqual((await together.check()).components.map(component => component.status), ['update', 'update']);
+    assert.equal((await together.start()).status, 'updated');
+});
+
+test('a missing frontend is reported and the server still updates', async t => {
+    const host = makeHost();
+    t.after(() => fs.rmSync(host.root, { recursive: true, force: true }));
+    fs.rmSync(host.frontend, { recursive: true, force: true });
+    const updater = makeUpdater(host);
+    const report = await updater.check();
+    assert.equal(report.components[0].status, 'missing');
+    assert.equal(report.components[0].code, 'UPDATER_COMPONENT_MISSING');
+    assert.equal(report.components[1].status, 'update');
+    assert.equal((await updater.start()).status, 'updated');
+    assert.equal(fs.readFileSync(path.join(host.server, 'index.cjs'), 'utf8'), 'new server\n');
 });
 
 test('development channels plan branch-head updates without a release tag', async t => {
@@ -361,7 +422,7 @@ test('development channels plan branch-head updates without a release tag', asyn
     assert.equal((await updater.start()).status, 'updated');
 });
 
-test('a failed second download leaves both installed components unchanged and releases the lock', async t => {
+test('a failed download blocks only that component and releases the lock', async t => {
     const host = makeHost();
     t.after(() => fs.rmSync(host.root, { recursive: true, force: true }));
     const updater = makeUpdater(host, {}, {
@@ -371,10 +432,13 @@ test('a failed second download leaves both installed components unchanged and re
             return { branchHead: FRONTEND_TIP, history: chain(FRONTEND_TIP, FRONTEND_OLD) };
         },
     });
-    assert.equal((await updater.start()).status, 'failed');
-    assert.equal(fs.readFileSync(path.join(host.frontend, 'index.js'), 'utf8'), 'old frontend\n');
+    const result = await updater.start();
+    assert.equal(result.status, 'updated');
+    assert.equal(result.components[1].status, 'blocked');
+    assert.match(result.components[1].reason, /fixture download failed/u);
+    assert.equal(fs.readFileSync(path.join(host.frontend, 'index.js'), 'utf8'), 'new frontend\n');
     assert.equal(fs.readFileSync(path.join(host.server, 'index.cjs'), 'utf8'), 'old server\n');
-    assert.deepEqual(fs.readdirSync(host.root).filter(name => name.startsWith('.paygo-install')), []);
+    assert.deepEqual(fs.readdirSync(host.root).filter(name => name.startsWith('.paygo-install') && name !== '.paygo-install-backups'), []);
 });
 
 test('edits made during preparation are detected before either installation is moved', async t => {
