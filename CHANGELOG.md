@@ -1,5 +1,10 @@
 # 更新日志
 
+## 0.6.0-hotfix1 · 2026-10-22 · 前端热修复配套版本
+
+- 与前端 `v0.6.0-hotfix1` 配套发布，后端代码与 0.6.0 相同，协议保持 v2。安装器要求前后端选中同名 tag，因此需要这个配套 tag。
+- 前端将单条回复费用的默认位置恢复为头像下方，详见前端仓库的 [CHANGELOG](https://github.com/mananekoha114/ST-Vertex-PayGo/blob/main/CHANGELOG.md)。
+
 ## 0.6.0 · 2026-10-22 · 反向代理、Argon 与面板维护
 
 ### AI Studio 反向代理
