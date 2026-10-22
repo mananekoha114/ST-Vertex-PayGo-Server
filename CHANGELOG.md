@@ -1,18 +1,20 @@
 # 更新日志
 
-## 0.6.0 · 2026-10-22
+## 0.6.0 · 2026-10-22 · 反向代理、Argon 与面板维护
+
+### AI Studio 反向代理
 
 - AI Studio 原生请求支持宿主填写的反向代理地址与代理密码；Standard / Flex 与 Gemini 4 均保留流式转发和用量采集，代理优先于官方密钥及显式 secret ID。
 - 支持 HTTP / HTTPS 与路径前缀，按请求票据绑定代理基址、模型、API 版本、动作及流式参数，并在转发前再次校验；诊断日志不记录代理地址和密码。
-- 与前端同步更新到 0.6.0，协议仍为 v2。需更新两个组件、重启宿主并刷新前端页面；Vertex 自定义反代与独立 OpenAI 兼容桥接的行为保持原状。
 
-## 未发布 · 用户数据恢复点
+### Gemini 4 Argon 原生请求
 
-- 在启动、界面实际更新前和恢复前，为有变化的用量账本与桥接配置保存快照，沿用宿主每用户备份目录和保留份数轮换，不新增运行时依赖。
-- PayGo 面板可选择自己的恢复点并安排下次重启应用，也可取消待恢复请求；替换失败回滚，中途退出后在下次启动恢复原文件。现有代码更新备份和版本规则保持原状。
-- 新增数据快照元数据与恢复接口，以及 `capabilities.dataBackups`。覆盖范围、恢复桥接 key 的影响与宿主 ZIP 使用方式见 [docs/data-backups.md](docs/data-backups.md)。
+- 新增同源接口 `POST /api/plugins/vertex-paygo/native-gemini/generate`，复用宿主的 Gemini 提示词转换与安全设置序列化 `gemini-4-argon` / `gemini-4-argon-cyber-permissive` 请求；宿主缺少所需转换函数时返回 `INCOMPATIBLE_SILLYTAVERN`，不会静默降级。
+- 长输出按 continuation token 多段续传：流式逐段转发，非流式合并全部片段；每段保留原始 `max_tokens`，并按每段最终 usage 汇总用量。中断、缺失或重复续传令牌、超出续传次数及缺少终止原因都会明确失败。
+- Vertex 的 Argon 请求在校验票据目标后允许使用 `v1beta1`，其他模型仍只允许 `v1`；原有目标、票据、凭证与服务层验证保持不变。
+- `/health` 的 `capabilities` 与 `/prepare` 响应新增 `nativeGemini4` 字段；前端依据准备结果发送 Argon 请求，旧服务端会提示升级，不会回退到缺少思考配置的请求。前端兼容行为见前端仓库的 [GEMINI4.md](https://github.com/mananekoha114/ST-Vertex-PayGo/blob/main/GEMINI4.md)。
 
-## 未发布 · 面板内配套更新
+### 面板内配套更新
 
 - 前端面板新增管理员专用的组件更新入口：检查两个组件、把同一配套 tag 应用到前后端、替换前备份、失败回滚，效果与命令行的更新入口一致。
 - 更新在宿主运行中完成，不依赖系统 Git 与 npm：isomorphic-git 以打包产物入库，用户仍不需要安装任何依赖；`npm run vendor:check` 会在产物与固定版本不一致时失败。
@@ -24,25 +26,33 @@
 - 新增三条管理员接口 `GET/POST /api/plugins/vertex-paygo/update` 与 `GET /api/plugins/vertex-paygo/update/status`，并在 `/health` 的 `capabilities` 中增加 `updater` 字段。规则与恢复边界见 [docs/in-app-updates.md](docs/in-app-updates.md)。
 - 宿主的 `enableServerPluginsAutoUpdate` 与 Luker 自带的扩展更新按钮不受影响，也不会被本功能修改；固定版本的用户需自行关闭宿主自动更新。
 
-## 2026-10-16 · 0.5.1 请求失败诊断配套版本
+### 用户数据恢复点
+
+- 在启动、界面实际更新前和恢复前，为有变化的用量账本与桥接配置保存快照，沿用宿主每用户备份目录和保留份数轮换，不新增运行时依赖。
+- PayGo 面板可选择自己的恢复点并安排下次重启应用，也可取消待恢复请求；替换失败回滚，中途退出后在下次启动恢复原文件。现有代码更新备份和版本规则保持原状。
+- 新增数据快照元数据与恢复接口，以及 `capabilities.dataBackups`。覆盖范围、恢复桥接 key 的影响与宿主 ZIP 使用方式见 [docs/data-backups.md](docs/data-backups.md)。
+
+### 升级说明
+
+- 与前端同步更新到 **0.6.0**，协议仍为 v2。需更新两个组件、重启宿主并刷新前端页面。
+- 面板内更新本版才首次提供，从 v0.5.x 升级时请使用命令行更新入口或宿主的插件管理界面；之后的版本可在面板内更新。
+- Vertex 自定义反代与独立 OpenAI 兼容桥接的行为保持原状。
+
+## 0.5.1 · 2026-10-16 · 请求失败诊断配套版本
 
 - 与前端 v0.5.1 配套发布，更新插件版本标识，协议保持 v2。
 - 前端在准备或参数校验失败时终止生成，保留本插件返回的错误码、消息及 HTTP 状态，不再由失败兜底请求触发二次 CSRF 错误。
 - 服务端认证、票据和回环代理行为沿用 v0.5.0。
 
-## 2026-10-14 · 0.5.0 Google OpenAI 兼容桥接
+## 0.5.0 · 2026-10-14 · Google OpenAI 兼容桥接
 
 - 发布前后端配套 0.5.0（沿用预发布渠道）；从仅内存保存的旧版桥接升级后需首次手动启用，已有持久化配置继续使用，之后按保存状态自动恢复。桥接仅支持 SillyTavern/Luker，不支持 TauriTavern。
-
 - 按用户原子保存桥接开启状态、固定连接、访问 key 与协议/层级/debug 设置；ST/Luker 启动后自动恢复，无需打开浏览器。关闭状态也会保存，未配置用户默认关闭；恢复失败保持关闭并可清除启动记忆，旧式凭据指纹变化时拒绝换号。
-
 - Vertex 桥接新增用户可选的 Gemini→OpenAI 网关，使用已绑定项目、区域、模型与服务账号，转换原生 JSON/SSE；AI Studio 保持原有 OpenAI 转发行为。
 - Vertex 层级可独立选择或逐请求跟随已保存主 API 的层级/PayGo-only；原生 OpenAI 模式拒绝 Flex，Flex/Priority 要求 global，Flex 网关期限延长到 30 分钟。
 - 桥接层级由服务端设置决定，拒绝 Vertex 调用方的 service_tier/serviceTier 覆盖；跟随设置失败明确报错，不降级、不换凭据或连接；网关日志分别保留 Gemini 转发正文、Google 原始响应及 OpenAI 客户端响应。
-
 - 安全审查修复：补全具名凭据、JSON 转义和截断边界的日志脱敏；认证超时、取消或轮换 key 后仍保留未完成 OAuth 的并发名额。
 - 请求体、模型目录和日志捕获改为固定块累积，避免大量微小数据块放大内存对象开销；增加异常上游断流与认证生命周期回归测试。
-
 - 增加按用户控制的 localhost 浏览器 CORS Debug 选项，默认关闭，实际请求继续要求桥接 key。
 - 模型列表接入 AI Studio 官方 OpenAI 目录及 Vertex 官方 Publisher Model 分页目录，保留官方 OpenAI 生成转发路径。
 - 为 ST/Luker 增加默认关闭、按用户隔离的本机 `/openai/v1` 入口及已登录用户管理接口。
@@ -50,7 +60,7 @@
 - 支持固定连接、`st-current` 别名、JSON/SSE 透传、访问 key 轮换和撤销；重启后恢复已成功保存的开启状态。
 - 增加请求体、并发、超时和取消保护；不转发调用方凭据，不将桥接调用记入主聊天费用账本。
 
-## 2026-09-22 · 0.4.0 对话用量与 Standard 代理
+## 0.4.0 · 2026-09-22 · 对话用量与 Standard 代理
 
 - 协议升级到 v2；Vertex AI 与 Google AI Studio 的 Gemini Standard 请求可经安全回环代理，且不注入 PayGo-only、Flex 或 Priority 参数。
 - 透明解析流式 SSE 和非流 JSON 的累计 `usageMetadata`，支持拆包并保持原响应字节不变；缺失、截断、压缩或解析失败会留下明确的不完整记录。
@@ -58,7 +68,7 @@
 - `prepare` 新增 `usageChatId`、USD/百万 token 价格快照和独立随机 `usageId`；未知用量或价格不会被当作零费用。
 - Vertex Express/Full 显式密钥 ID 通过宿主密钥存储和窄认证辅助函数严格适配；缺少所需接口或所选密钥时 fail closed，不会静默使用其他凭据。
 
-## 2026-09-16 · 凭据与资源隔离修复
+## 0.3.1 · 2026-09-16 · 凭据与资源隔离修复
 
 - AI Studio 严格按当前用户及 `secret_id` 选取密钥，缺失时不回退默认凭据。
 - 为票据增加单用户额度、每分钟签发限速和认证前容量预留，防止单用户占满共享池。
