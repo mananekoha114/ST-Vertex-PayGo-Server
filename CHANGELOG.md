@@ -1,6 +1,22 @@
 # 更新日志
 
-## 未发布 · 前后端独立更新
+## 0.6.1-pre1 · 2026-10-23 · 预发布：Argon 不出字修复
+
+预发布版本，与前端 `v0.6.1-pre1` 配套，协议保持 v2。
+
+### Argon 流式输出
+
+- 原生 Gemini 接口的流式响应改为 `Cache-Control: no-store, no-transform` 并附 `X-Accel-Buffering: no`。SillyTavern 1.16–1.18 在 `server-main.js` 全局挂载 `compression()`，而它会压缩 `text/event-stream`；此前每一帧都被缓冲到生成结束才送达浏览器。
+- 新增专门的宿主流式测试 `npm run test:host-streaming`：在真实 SillyTavern 的 express、compression 与 body-parser 中运行回环代理、Gemini 4 续传和原生接口，逐帧确认流式数据在 Google 发出下一帧前已到达客户端，并用宿主自己的 `getStreamingReply` / `tryParseStreamingError` 解析结果。另含去掉 `no-transform` 的对照用例，以及 Google 拒绝、思考耗尽预算、续传中途失败三种场景。`PAYGO_ST_ROOT` 指定宿主目录，`PAYGO_REQUIRE_HOST=1` 时缺少宿主即失败。GitHub Actions 工作流 `Host streaming` 在 SillyTavern 1.16.0 / 1.17.0 / 1.18.0 与 Node 20 / 24 上运行。
+
+### Gemini 4 Argon 诊断
+
+- Google 上游错误保留 HTTP 状态、`status` 与经过脱敏、截断的 `message`（`GEMINI4_UPSTREAM_HTTP_ERROR`，附 `details`）；原生接口按宿主可读的 `error.message` 格式返回，并把上游 401 映射为 400，避免重置宿主 Basic 认证。
+- 流式输出开始后的失败以 SSE 错误事件结束，不再直接断开连接。
+- 结束时没有正文：`MAX_TOKENS` 返回 `GEMINI4_OUTPUT_BUDGET_EXHAUSTED`，其他原因返回带 `details.reason` 的 `NATIVE_GEMINI_EMPTY_RESPONSE`。
+- AI Studio 以 `MAX_TOKENS` 加续传令牌标记单次请求上限时，若累计用量仍低于请求预算则沿用同一预算续传；Vertex 仍只按 `CONTINUATION` 续传。
+
+### 前后端独立更新
 
 - 面板内更新器不再要求前后端 tag 同名，两个组件各自跟随自己的跟踪分支与发布 tag。
 - 组件缺失、不是 Git 检出、有本地修改或下载失败时，只把该组件报告为 `missing` / `blocked`（附 `code` 与 `reason`），另一个组件照常检查和更新；检查结果新增 `partial` 字段。全部组件都不能更新时仍以 `UPDATER_COMPONENT_BLOCKED` 失败且不替换任何文件。

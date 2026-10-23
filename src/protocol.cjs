@@ -12,7 +12,7 @@ const { PluginError } = require('./errors.cjs');
 
 const PROTOCOL_VERSION = 2;
 const PLUGIN_ID = 'vertex-paygo';
-const PLUGIN_VERSION = '0.6.0';
+const PLUGIN_VERSION = '0.6.1-pre1';
 const COMPATIBLE_ST_RANGE = '>=1.16.0';
 const TIERS = Object.freeze(['standard', 'flex', 'priority']);
 const AUTH_MODES = Object.freeze(['express', 'full']);
