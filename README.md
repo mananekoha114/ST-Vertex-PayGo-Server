@@ -208,6 +208,8 @@ Google AI Studio 的 Standard 与 Flex 模式复用相同的预检机制、鉴�
 
 ## 运行日志系统
 
+Gemini 4 Argon（含 `gemini-4-argon-cyber-permissive`）通过插件原生接口生成时，也会在 ST/Luker 的服务端控制台输出类似宿主 Google 接口的调用信息：`Google AI Studio request:` 或 `Google Vertex AI request:`、非流式 `response:`，以及流式开始、完成、失败或取消状态。完成摘要包含耗时、结束原因与汇总用量；流式输出不逐帧打印或为日志缓存回复正文。请求与非流式响应正文使用 `console.debug`，可见性跟随宿主日志等级；**这些控制台正文包含提示词和模型输出**。仅打印转换后的 Gemini 正文，不打印认证头、代理地址或凭据；签名与续传 token 从控制台副本中移除。错误摘要只记录错误码等元数据，不打印原始异常。此行为不向下述诊断文件写入正文；更新服务端插件后需重启宿主生效。
+
 自 0.3.0 起，插件会在宿主根目录下维护统一的结构化诊断日志：
 
 ```text

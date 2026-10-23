@@ -3,8 +3,20 @@
 const http = require('node:http');
 const { randomUUID } = require('node:crypto');
 const { Readable } = require('node:stream');
+const { inspect } = require('node:util');
 const { PluginError, asPluginError, errorPayload } = require('./errors.cjs');
 const { writeResponse } = require('./gemini4-transport.cjs');
+const { sanitizeUsage } = require('./usage-capture.cjs');
+
+// Match the host's console body logs without exposing private transport metadata.
+// These logs deliberately do not go through the body-free diagnostic LogStore.
+function consoleBody(value) {
+    if (Array.isArray(value)) return value.map(consoleBody);
+    if (!value || typeof value !== 'object') return value;
+    return Object.fromEntries(Object.entries(value)
+        .filter(([key]) => !['thoughtSignature', 'continuationToken', 'nativeGeminiSignature'].includes(key))
+        .map(([key, item]) => [key, consoleBody(item)]));
+}
 const TOOL_PREFIX = 'st-vertex-paygo-tool:v1:';
 function unpackToolSignature(value) {
     if (typeof value !== 'string' || !value.startsWith(TOOL_PREFIX)) return null;
@@ -185,9 +197,16 @@ function requestLoopback(url, { method, headers, body, signal, timeoutMs = 31 * 
         outgoing.end(body);
     });
 }
-function createNativeGeminiHandler({ runtime, loopbackTransport, fetchImpl = requestLoopback, upstreamTimeoutMs = 31 * 60 * 1000 }) {
+function createNativeGeminiHandler({ runtime, loopbackTransport, fetchImpl = requestLoopback, upstreamTimeoutMs = 31 * 60 * 1000, logger = console }) {
     return async (request, response) => {
         let streaming = false;
+        const started = Date.now();
+        const apiName = request.body?.chat_completion_source === 'vertexai' ? 'Google Vertex AI' : 'Google AI Studio';
+        const log = (level, event, details) => {
+            // Console failures must never change generation or cancellation.
+            try { logger?.[level]?.(`${apiName} ${event}`, inspect(level === 'debug' ? consoleBody(details) : details, { depth: 5, colors: true })); } catch { /* Best effort. */ }
+        };
+        const completed = details => log('info', 'request completed:', { elapsedMs: Date.now() - started, ...details });
         const controller = new AbortController();
         const abort = () => controller.abort();
         const close = () => { if (!response.writableEnded) abort(); };
@@ -210,6 +229,7 @@ function createNativeGeminiHandler({ runtime, loopbackTransport, fetchImpl = req
             const headers = { 'Content-Type': 'application/json' };
             if (source === 'vertexai') headers.Authorization = `Bearer ${input.proxy_password}`;
             else url.searchParams.set('key', input.proxy_password);
+            log('debug', 'request:', { model: input.model, stream: Boolean(input.stream), ...body });
             const upstream = await fetchImpl(url, { method: 'POST', headers, body: JSON.stringify(body), signal: controller.signal, redirect: 'error', timeoutMs: upstreamTimeoutMs });
             if (!upstream.ok) throw await readLoopbackFailure(upstream);
             if (input.stream) {
@@ -225,6 +245,7 @@ function createNativeGeminiHandler({ runtime, loopbackTransport, fetchImpl = req
                 const decoder = new TextDecoder();
                 const state = { textParts: [], visible: false, errored: false, reason: undefined };
                 streaming = true;
+                log('info', 'streaming request in progress:', { model: input.model });
                 for await (const chunk of Readable.fromWeb(upstream.body)) {
                     controller.signal.throwIfAborted();
                     buffer += decoder.decode(chunk, { stream: true });
@@ -235,19 +256,31 @@ function createNativeGeminiHandler({ runtime, loopbackTransport, fetchImpl = req
                 buffer += decoder.decode();
                 if (buffer.length > maxEventCharacters) throw tooLarge();
                 if (buffer) await writeResponse(response, transformFrame(buffer, state));
-                if (state.reason && !state.visible && !state.errored) await writeResponse(response, errorFrame(noVisibleOutput(state.reason)));
+                if (state.reason && !state.visible && !state.errored) {
+                    const failure = noVisibleOutput(state.reason);
+                    state.errored = true;
+                    state.failureCode = failure.code;
+                    await writeResponse(response, errorFrame(failure));
+                }
                 response.end();
+                if (state.errored) log('warn', 'request failed:', { code: state.failureCode, elapsedMs: Date.now() - started });
+                else completed({ model: input.model, stream: true, finishReason: state.reason, usageMetadata: state.usage });
             } else {
                 response.setHeader('Cache-Control', 'no-store');
-                const data = wrapToolMetadata(await upstream.json());
+                const data = await upstream.json();
+                log('debug', 'response:', data);
+                wrapToolMetadata(data);
                 const content = data.candidates?.[0]?.content;
                 if (!(content?.parts ?? []).some(isVisiblePart)) throw noVisibleOutput(data.promptFeedback?.blockReason ?? data.candidates?.[0]?.finishReason);
                 const nativeGeminiSignature = packTextSignature(collectTextParts(content.parts));
                 if (nativeGeminiSignature) content.parts.push({ text: '', thoughtSignature: nativeGeminiSignature });
                 response.json({ ...data, nativeGeminiSignature, choices: [{ message: { content: (content?.parts ?? []).filter(part => !part.thought && typeof part.text === 'string').map(part => part.text).join('') } }], responseContent: content });
+                completed({ model: input.model, stream: false, finishReason: data.candidates?.[0]?.finishReason, usageMetadata: sanitizeUsage(data.usageMetadata) });
             }
         } catch (error) {
             const failure = error instanceof PluginError ? error : new PluginError(502, 'NATIVE_GEMINI_FAILED', 'Native Gemini generation could not be completed.');
+            if (controller.signal.aborted) log('info', 'request cancelled:', { elapsedMs: Date.now() - started });
+            else log('warn', 'request failed:', { code: failure.code, status: failure.status, elapsedMs: Date.now() - started });
             if (controller.signal.aborted || response.writableEnded) { if (streaming && !response.writableEnded) response.destroy?.(); }
             else if (streaming || response.headersSent) {
                 // SSE status is already committed; end with an event the host shows.
@@ -261,7 +294,12 @@ function transformFrame(frame, state) {
     if (!data || data === '[DONE]') return frame + '\n\n';
     try {
         const parsed = wrapToolMetadata(JSON.parse(data));
-        if (parsed.error) state.errored = true;
+        if (parsed.error) {
+            state.errored = true;
+            state.failureCode = typeof parsed.error.code === 'string' && /^[A-Z0-9_]{1,80}$/u.test(parsed.error.code)
+                ? parsed.error.code : 'NATIVE_GEMINI_UPSTREAM_FAILED';
+        }
+        if (parsed.usageMetadata) state.usage = sanitizeUsage(parsed.usageMetadata);
         if (typeof parsed.promptFeedback?.blockReason === 'string') state.reason = parsed.promptFeedback.blockReason;
         const candidate = parsed.candidates?.[0];
         if (candidate) {
