@@ -2,9 +2,9 @@
 
 const http = require('node:http');
 const { randomUUID } = require('node:crypto');
-const { Readable, Transform } = require('node:stream');
-const { pipeline } = require('node:stream/promises');
-const { PluginError, sendExpressError } = require('./errors.cjs');
+const { Readable } = require('node:stream');
+const { PluginError, asPluginError, errorPayload } = require('./errors.cjs');
+const { writeResponse } = require('./gemini4-transport.cjs');
 const TOOL_PREFIX = 'st-vertex-paygo-tool:v1:';
 function unpackToolSignature(value) {
     if (typeof value !== 'string' || !value.startsWith(TOOL_PREFIX)) return null;
@@ -31,6 +31,32 @@ function unpackTextSignature(value) {
         if (typeof data.text !== 'string' || !Array.isArray(data.parts) || data.parts.some(part => typeof part.text !== 'string' || (part.thoughtSignature !== undefined && typeof part.thoughtSignature !== 'string')) || data.parts.map(part => part.text).join('') !== data.text) return null;
         return data;
     } catch { return null; }
+}
+const isVisiblePart = part => !part.thought && ((typeof part.text === 'string' && part.text.trim().length > 0)
+    || Boolean(part.functionCall || part.inlineData || part.executableCode || part.codeExecutionResult));
+// A terminal response without reply text otherwise reaches the host as an
+// empty message. Thinking tokens share maxOutputTokens with the reply.
+function noVisibleOutput(reason) {
+    const safeReason = typeof reason === 'string' && /^[A-Z_]{1,80}$/u.test(reason) ? reason : undefined;
+    const details = safeReason ? { reason: safeReason } : undefined;
+    if (safeReason === 'MAX_TOKENS') return new PluginError(502, 'GEMINI4_OUTPUT_BUDGET_EXHAUSTED', 'Gemini 4 used the whole output budget before writing reply text. Thinking tokens count toward the maximum response length; raise it or lower the reasoning effort.', { details });
+    return new PluginError(502, 'NATIVE_GEMINI_EMPTY_RESPONSE', `Native Gemini returned no reply text${safeReason ? ` (${safeReason})` : ''}.`, { details });
+}
+// The host reads data.error.message from both JSON failures and SSE events.
+const hostErrorBody = error => ({ error: errorPayload(error), code: error.code, message: error.message });
+const errorFrame = error => `data: ${JSON.stringify({ error: errorPayload(asPluginError(error)) })}\n\n`;
+async function readLoopbackFailure(upstream) {
+    let body;
+    try { body = typeof upstream.json === 'function' ? await upstream.json() : undefined; } catch { /* Not a plugin error body. */ }
+    if (body === undefined) await upstream.body?.cancel?.().catch(() => {});
+    // Google rejects bad OAuth tokens with 401, which would reset host Basic auth.
+    const status = upstream.status === 401 ? 400 : upstream.status >= 400 && upstream.status <= 599 ? upstream.status : 502;
+    // The loopback proxy only returns this plugin's own sanitized errors.
+    if (typeof body?.code === 'string' && /^[A-Z0-9_]{1,80}$/u.test(body.code) && typeof body.message === 'string' && body.message) {
+        const details = body.details && typeof body.details === 'object' && !Array.isArray(body.details) ? body.details : undefined;
+        return new PluginError(status, body.code, body.message.slice(0, 1000), { details });
+    }
+    return new PluginError(status, 'NATIVE_GEMINI_UPSTREAM_FAILED', 'Native Gemini generation failed.');
 }
 function collectTextParts(parts) {
     return (parts ?? []).filter(part => !part.thought && typeof part.text === 'string').map(part => ({ text: part.text, ...(typeof part.thoughtSignature === 'string' ? { thoughtSignature: part.thoughtSignature } : {}) }));
@@ -161,6 +187,7 @@ function requestLoopback(url, { method, headers, body, signal, timeoutMs = 31 * 
 }
 function createNativeGeminiHandler({ runtime, loopbackTransport, fetchImpl = requestLoopback, upstreamTimeoutMs = 31 * 60 * 1000 }) {
     return async (request, response) => {
+        let streaming = false;
         const controller = new AbortController();
         const abort = () => controller.abort();
         const close = () => { if (!response.writableEnded) abort(); };
@@ -184,41 +211,66 @@ function createNativeGeminiHandler({ runtime, loopbackTransport, fetchImpl = req
             if (source === 'vertexai') headers.Authorization = `Bearer ${input.proxy_password}`;
             else url.searchParams.set('key', input.proxy_password);
             const upstream = await fetchImpl(url, { method: 'POST', headers, body: JSON.stringify(body), signal: controller.signal, redirect: 'error', timeoutMs: upstreamTimeoutMs });
-            if (!upstream.ok) { await upstream.body?.cancel().catch(() => {}); throw new PluginError(upstream.status >= 400 && upstream.status <= 599 ? upstream.status : 502, 'NATIVE_GEMINI_UPSTREAM_FAILED', 'Native Gemini generation failed.'); }
-            response.setHeader('Cache-Control', 'no-store');
+            if (!upstream.ok) throw await readLoopbackFailure(upstream);
             if (input.stream) {
+                // ST mounts compression() globally and it compresses text/event-stream:
+                // without no-transform every frame is held until generation ends.
+                response.setHeader('Cache-Control', 'no-store, no-transform');
+                // Same for nginx-style reverse proxies in front of the host.
+                response.setHeader('X-Accel-Buffering', 'no');
                 response.setHeader('Content-Type', 'text/event-stream');
                 let buffer = '';
                 const maxEventCharacters = 32 * 1024 * 1024;
+                const tooLarge = () => new PluginError(502, 'NATIVE_GEMINI_INVALID_RESPONSE', 'Native Gemini returned a stream event that is too large.');
                 const decoder = new TextDecoder();
-                const textParts = [];
-                const transformNativeFrame = frame => transformFrame(frame, textParts);
-                const transform = new Transform({ transform(chunk, encoding, done) { buffer += decoder.decode(chunk, { stream: true }); const frames = buffer.split(/\r?\n\r?\n/u); buffer = frames.pop(); try { if (buffer.length > maxEventCharacters || frames.some(frame => frame.length > maxEventCharacters)) throw new Error('Stream event too large'); for (const frame of frames) this.push(transformNativeFrame(frame)); done(); } catch (error) { done(error); } }, flush(done) { try { buffer += decoder.decode(); if (buffer.length > maxEventCharacters) throw new Error('Stream event too large'); if (buffer) this.push(transformNativeFrame(buffer)); done(); } catch (error) { done(error); } } });
-                await pipeline(Readable.fromWeb(upstream.body), transform, response, { signal: controller.signal });
+                const state = { textParts: [], visible: false, errored: false, reason: undefined };
+                streaming = true;
+                for await (const chunk of Readable.fromWeb(upstream.body)) {
+                    controller.signal.throwIfAborted();
+                    buffer += decoder.decode(chunk, { stream: true });
+                    const frames = buffer.split(/\r?\n\r?\n/u); buffer = frames.pop();
+                    if (buffer.length > maxEventCharacters || frames.some(frame => frame.length > maxEventCharacters)) throw tooLarge();
+                    for (const frame of frames) await writeResponse(response, transformFrame(frame, state));
+                }
+                buffer += decoder.decode();
+                if (buffer.length > maxEventCharacters) throw tooLarge();
+                if (buffer) await writeResponse(response, transformFrame(buffer, state));
+                if (state.reason && !state.visible && !state.errored) await writeResponse(response, errorFrame(noVisibleOutput(state.reason)));
+                response.end();
             } else {
+                response.setHeader('Cache-Control', 'no-store');
                 const data = wrapToolMetadata(await upstream.json());
                 const content = data.candidates?.[0]?.content;
-                if (!Array.isArray(content?.parts) || !content.parts.length) { const reason = data.promptFeedback?.blockReason ?? data.candidates?.[0]?.finishReason; const safeReason = typeof reason === 'string' && /^[A-Z_]{1,80}$/u.test(reason) ? ` (${reason})` : ''; throw new PluginError(502, 'NATIVE_GEMINI_EMPTY_RESPONSE', `Native Gemini returned no candidate content${safeReason}.`); }
+                if (!(content?.parts ?? []).some(isVisiblePart)) throw noVisibleOutput(data.promptFeedback?.blockReason ?? data.candidates?.[0]?.finishReason);
                 const nativeGeminiSignature = packTextSignature(collectTextParts(content.parts));
                 if (nativeGeminiSignature) content.parts.push({ text: '', thoughtSignature: nativeGeminiSignature });
                 response.json({ ...data, nativeGeminiSignature, choices: [{ message: { content: (content?.parts ?? []).filter(part => !part.thought && typeof part.text === 'string').map(part => part.text).join('') } }], responseContent: content });
             }
         } catch (error) {
-            if (response.headersSent) response.destroy();
-            else if (!controller.signal.aborted) sendExpressError(response, error instanceof PluginError ? error : new PluginError(502, 'NATIVE_GEMINI_FAILED', 'Native Gemini generation could not be completed.'));
+            const failure = error instanceof PluginError ? error : new PluginError(502, 'NATIVE_GEMINI_FAILED', 'Native Gemini generation could not be completed.');
+            if (controller.signal.aborted || response.writableEnded) { if (streaming && !response.writableEnded) response.destroy?.(); }
+            else if (streaming || response.headersSent) {
+                // SSE status is already committed; end with an event the host shows.
+                try { await writeResponse(response, errorFrame(failure)); response.end(); } catch { response.destroy(); }
+            } else response.status(failure.status).json(hostErrorBody(failure));
         } finally { request.removeListener('aborted', abort); response.removeListener('close', close); }
     };
 }
-function transformFrame(frame, textParts) {
+function transformFrame(frame, state) {
     const lines = frame.split(/\r?\n/u), data = lines.filter(line => line.startsWith('data:')).map(line => line.slice(5).trimStart()).join('\n');
     if (!data || data === '[DONE]') return frame + '\n\n';
     try {
         const parsed = wrapToolMetadata(JSON.parse(data));
+        if (parsed.error) state.errored = true;
+        if (typeof parsed.promptFeedback?.blockReason === 'string') state.reason = parsed.promptFeedback.blockReason;
         const candidate = parsed.candidates?.[0];
         if (candidate) {
-            textParts.push(...collectTextParts(candidate.content?.parts));
+            const parts = candidate.content?.parts ?? [];
+            if (parts.some(isVisiblePart)) state.visible = true;
+            state.textParts.push(...collectTextParts(parts));
             if (candidate.finishReason) {
-                const signature = packTextSignature(textParts);
+                state.reason = candidate.finishReason;
+                const signature = packTextSignature(state.textParts);
                 if (signature) { candidate.content ??= { role: 'model', parts: [] }; candidate.content.parts ??= []; candidate.content.parts.push({ text: '', thoughtSignature: signature }); }
             }
         }

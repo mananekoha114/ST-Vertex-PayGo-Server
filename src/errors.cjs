@@ -14,6 +14,8 @@ class PluginError extends Error {
         this.name = 'PluginError';
         this.status = status;
         this.code = code;
+        // Browser-safe structured context; never put credentials here.
+        if (options?.details) this.details = options.details;
     }
 }
 
@@ -30,27 +32,30 @@ function asPluginError(error) {
     );
 }
 
+function errorPayload(error) {
+    return {
+        code: error.code,
+        message: error.message,
+        ...(error.details ? { details: error.details } : {}),
+    };
+}
+
 function sendExpressError(response, error) {
     const safeError = asPluginError(error);
-    return response.status(safeError.status).json({
-        error: true,
-        code: safeError.code,
-        message: safeError.message,
-    });
+    return response.status(safeError.status).json({ error: true, ...errorPayload(safeError) });
 }
 
 function sendNodeError(response, error) {
     const safeError = asPluginError(error);
-    if (response.headersSent || response.writableEnded) {
+    // An ended response already delivered its own terminal event; destroying
+    // it now could discard that event before it is flushed.
+    if (response.writableEnded) return;
+    if (response.headersSent) {
         response.destroy();
         return;
     }
 
-    const body = Buffer.from(JSON.stringify({
-        error: true,
-        code: safeError.code,
-        message: safeError.message,
-    }));
+    const body = Buffer.from(JSON.stringify({ error: true, ...errorPayload(safeError) }));
 
     response.writeHead(safeError.status, {
         'Content-Type': 'application/json; charset=utf-8',
@@ -63,6 +68,7 @@ function sendNodeError(response, error) {
 module.exports = {
     PluginError,
     asPluginError,
+    errorPayload,
     sendExpressError,
     sendNodeError,
 };

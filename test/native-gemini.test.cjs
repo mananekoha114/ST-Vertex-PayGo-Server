@@ -113,3 +113,41 @@ test('local HTTP nonstream reader handles delayed chunks without web-stream prec
     const server=http.createServer((_req,res)=>{res.write('{"text":"');setTimeout(()=>{res.write('first');setTimeout(()=>res.end('second"}'),15);},15);});await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
     try {const result=await requestLoopback(new URL(`http://127.0.0.1:${server.address().port}`),{method:'POST',body:'{}'});await new Promise(resolve=>setTimeout(resolve,60));assert.deepEqual(await result.json(),{text:'firstsecond'});}finally {await new Promise(resolve=>server.close(resolve));}
 });
+
+const target={reverse_proxy:'http://127.0.0.1:1234/proxy/ticket',proxy_password:'private'};
+function sseHandler(frames,{fail}={}) {
+    return createNativeGeminiHandler({runtime,loopbackTransport:{baseUrl:'http://127.0.0.1:1234'},fetchImpl:async()=>({ok:true,body:new ReadableStream({start(c){c.enqueue(Buffer.from(frames.map(frame=>'data: '+JSON.stringify(frame)+'\n\n').join('')));if(fail)setTimeout(()=>c.error(fail),5);else c.close();}})})});
+}
+async function runStream(handler) {
+    const {Writable}=require('node:stream');const chunks=[];const res=new Writable({write(chunk,_enc,cb){chunks.push(chunk);cb();}});res.setHeader=()=>{};
+    await handler(request({...fixture,stream:true,...target}),res);
+    assert.equal(res.writableEnded,true);
+    return Buffer.concat(chunks).toString().trim().split('\n\n').map(frame=>JSON.parse(frame.replace(/^data: /,'')));
+}
+test('loopback failures keep the plugin code, message and details in a host-readable error', async () => {
+    const failure={error:true,code:'GEMINI4_UPSTREAM_HTTP_ERROR',message:'The Google upstream returned HTTP 401: Token expired',details:{upstreamStatus:401,upstreamMessage:'Token expired'}};
+    const handler=createNativeGeminiHandler({runtime,loopbackTransport:{baseUrl:'http://127.0.0.1:1234'},fetchImpl:async()=>({ok:false,status:401,json:async()=>failure})});
+    const res=response();await handler(request({...fixture,...target}),res);
+    assert.equal(res.statusCode,400);
+    assert.deepEqual(res.data,{error:{code:failure.code,message:failure.message,details:failure.details},code:failure.code,message:failure.message});
+});
+test('stream without reply text reports an exhausted output budget once', async () => {
+    const frames=await runStream(sseHandler([{candidates:[{content:{parts:[{thought:true,text:'thinking'},{text:''}]}}]},{candidates:[{finishReason:'MAX_TOKENS',content:{parts:[]}}]}]));
+    assert.equal(frames.filter(frame=>frame.error).length,1);
+    assert.equal(frames.at(-1).error.code,'GEMINI4_OUTPUT_BUDGET_EXHAUSTED');assert.deepEqual(frames.at(-1).error.details,{reason:'MAX_TOKENS'});
+    const truncated=await runStream(sseHandler([{candidates:[{content:{parts:[{text:'partial'}]}}]},{candidates:[{finishReason:'MAX_TOKENS'}]}]));
+    assert.equal(truncated.some(frame=>frame.error),false);
+    const blocked=await runStream(sseHandler([{promptFeedback:{blockReason:'PROHIBITED_CONTENT'}}]));
+    assert.equal(blocked.at(-1).error.code,'NATIVE_GEMINI_EMPTY_RESPONSE');assert.match(blocked.at(-1).error.message,/PROHIBITED_CONTENT/);
+});
+test('stream keeps an upstream error event and ends a broken stream with an error event', async () => {
+    const forwarded=await runStream(sseHandler([{candidates:[{content:{parts:[{thought:true,text:'thinking'}]}}]},{error:{code:'GEMINI4_UPSTREAM_HTTP_ERROR',message:'quota'}}]));
+    assert.deepEqual(forwarded.filter(frame=>frame.error).map(frame=>frame.error.message),['quota']);
+    const broken=await runStream(sseHandler([{candidates:[{content:{parts:[{text:'partial'}]}}]}],{fail:new Error('socket reset')}));
+    assert.equal(broken[0].candidates[0].content.parts[0].text,'partial');assert.equal(broken.at(-1).error.code,'NATIVE_GEMINI_FAILED');
+});
+test('nonstream thought-only MAX_TOKENS fails with the output budget code', async () => {
+    const handler=createNativeGeminiHandler({runtime,loopbackTransport:{baseUrl:'http://127.0.0.1:1234'},fetchImpl:async()=>({ok:true,json:async()=>({candidates:[{finishReason:'MAX_TOKENS',content:{parts:[{thought:true,text:'think'}]}}]})})});
+    const res=response();await handler(request({...fixture,...target}),res);
+    assert.equal(res.statusCode,502);assert.equal(res.data.error.code,'GEMINI4_OUTPUT_BUDGET_EXHAUSTED');assert.equal(res.data.error.message,res.data.message);
+});

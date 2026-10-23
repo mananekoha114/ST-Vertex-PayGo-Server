@@ -15,6 +15,7 @@
   },
   "scripts": {
     "test": "node --test",
+    "test:host-streaming": "node --test test/host-streaming.test.cjs",
     "vendor:build": "node scripts/build-vendor.mjs",
     "vendor:check": "node scripts/build-vendor.mjs --check",
     "policy:sync": "node scripts/sync-update-policy.mjs",

@@ -1,12 +1,40 @@
 'use strict';
 
 const { StringDecoder } = require('node:string_decoder');
-const { PluginError } = require('./errors.cjs');
+const { PluginError, asPluginError, errorPayload } = require('./errors.cjs');
 const { sanitizeUsage } = require('./usage-capture.cjs');
 const { validatePreparedGoogleTarget } = require('./target-policy.cjs');
 
 const isGemini4Argon = model => /^gemini-4-argon(?:-cyber-permissive)?$/u.test(model);
 const protocolError = (code, message) => new PluginError(502, code, message);
+const MAX_ERROR_BYTES = 64 * 1024;
+const redact = text => text.replace(/AIza[0-9A-Za-z_-]{35}/gu, '[redacted]').replace(/ya29\.[0-9A-Za-z._-]+/gu, '[redacted]');
+// Google's error message is the only actionable diagnosis (free tier, region,
+// invalid argument); keep it bounded and without credentials.
+function googleFailure(status, error, prefix = `The Google upstream returned HTTP ${status}`) {
+    const upstreamMessage = typeof error?.message === 'string'
+        ? redact(error.message).replace(/\s+/gu, ' ').trim().slice(0, 500) : '';
+    const googleStatus = typeof error?.status === 'string' && /^[A-Z_]{1,64}$/u.test(error.status) ? error.status : undefined;
+    return new PluginError(status >= 400 && status <= 599 ? status : 502, 'GEMINI4_UPSTREAM_HTTP_ERROR',
+        `${prefix}${googleStatus ? ` ${googleStatus}` : ''}${upstreamMessage ? `: ${upstreamMessage}` : '.'}`,
+        { details: { upstreamStatus: status, ...(googleStatus ? { googleStatus } : {}), ...(upstreamMessage ? { upstreamMessage } : {}) } });
+}
+async function readGoogleError(incoming) {
+    const chunks = [];
+    let size = 0;
+    try {
+        for await (const chunk of incoming) {
+            size += chunk.length;
+            if (size > MAX_ERROR_BYTES) break;
+            chunks.push(chunk);
+        }
+    } catch { /* Report whatever arrived. */ }
+    incoming.destroy();
+    try {
+        const parsed = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+        return (Array.isArray(parsed) ? parsed[0] : parsed)?.error;
+    } catch { return undefined; }
+}
 function addUsage(total, usage) {
     const result = { ...(total || {}) };
     for (const [key, value] of Object.entries(sanitizeUsage(usage) || {})) {
@@ -85,7 +113,8 @@ async function runGemini4Transport({ request, response, ticketData, target, upst
             activeIncoming = upstreamResponse;
             if (gone) { upstreamResponse.destroy(); throw protocolError('CLIENT_DISCONNECTED', 'The client disconnected.'); }
             const status = upstreamResponse.statusCode || 502;
-            if (status >= 300) { upstreamResponse.destroy(); throw protocolError('GEMINI4_UPSTREAM_HTTP_ERROR', `The Google upstream returned HTTP ${status}.`); }
+            if (status >= 300 && status < 400) { upstreamResponse.destroy(); throw protocolError('GEMINI4_UPSTREAM_HTTP_ERROR', `The Google upstream returned HTTP ${status}.`); }
+            if (status >= 400) throw googleFailure(status, await readGoogleError(upstreamResponse));
             const encoding = upstreamResponse.headers?.['content-encoding'];
             if (encoding && encoding !== 'identity') { upstreamResponse.destroy(); throw protocolError('GEMINI4_COMPRESSED_RESPONSE', 'The Google upstream returned unsupported compressed data.'); }
             let latestUsage;
@@ -93,7 +122,8 @@ async function runGemini4Transport({ request, response, ticketData, target, upst
             let reason;
             let lastCandidate;
             const accept = async value => {
-                if (!value || typeof value !== 'object' || value.error) throw protocolError('GEMINI4_UPSTREAM_ERROR', 'The Google upstream returned an error.');
+                if (!value || typeof value !== 'object') throw protocolError('GEMINI4_UPSTREAM_ERROR', 'The Google upstream returned an error.');
+                if (value.error) throw googleFailure(Number.isSafeInteger(value.error.code) ? value.error.code : 502, value.error, 'The Google upstream returned an error');
                 if (value.usageMetadata) { latestUsage = value.usageMetadata; onUsage(addUsage(usage, latestUsage), false); }
                 if (typeof value.continuationToken === 'string') latestToken = value.continuationToken;
                 const candidate = value.candidates?.[0];
@@ -149,7 +179,11 @@ async function runGemini4Transport({ request, response, ticketData, target, upst
             const measurable = Number.isSafeInteger(hopCount) && hopCount >= 0 && Number.isSafeInteger(thoughtCount) && thoughtCount >= 0;
             if (measurable) spent += hopCount + thoughtCount;
             // MAX_TOKENS is a user cap, never permission to buy another output budget.
-            if (reason === 'CONTINUATION') {
+            // AI Studio reports its per-request cap as MAX_TOKENS with a token;
+            // resume only while the measured total stays below the user's budget.
+            const perRequestCap = reason === 'MAX_TOKENS' && latestToken && ticketData.source === 'makersuite'
+                && bounded && measurable && spent < budget;
+            if (reason === 'CONTINUATION' || perRequestCap) {
                 if (!latestToken) throw protocolError('GEMINI4_CONTINUATION_TOKEN_MISSING', 'The Google continuation response did not include a token.');
                 if (!bounded || !measurable) throw protocolError('GEMINI4_CONTINUATION_BUDGET_UNKNOWN', 'The Google continuation cannot proceed without an explicit output budget and output usage.');
                 if (spent >= budget) reason = 'MAX_TOKENS';
@@ -175,6 +209,16 @@ async function runGemini4Transport({ request, response, ticketData, target, upst
             response.end();
             return;
         }
+    } catch (error) {
+        // Once SSE has started, an HTTP error status can no longer reach the
+        // browser. Finish with an error event the host displays instead.
+        if (ticketData.stream && response.headersSent && !response.writableEnded && !gone) {
+            try {
+                await write(response, `data: ${JSON.stringify({ error: errorPayload(asPluginError(error)) })}\n\n`);
+                response.end();
+            } catch { /* The proxy failure handler closes the response. */ }
+        }
+        throw error;
     } finally {
         request.off('aborted', abort);
         response.off('close', close);
@@ -182,4 +226,4 @@ async function runGemini4Transport({ request, response, ticketData, target, upst
         active?.destroy();
     }
 }
-module.exports = { isGemini4Argon, addUsage, runGemini4Transport };
+module.exports = { isGemini4Argon, addUsage, runGemini4Transport, writeResponse: write };
