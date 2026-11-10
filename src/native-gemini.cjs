@@ -6,6 +6,7 @@ const { Readable } = require('node:stream');
 const { inspect } = require('node:util');
 const { PluginError, asPluginError, errorPayload } = require('./errors.cjs');
 const { writeResponse } = require('./gemini4-transport.cjs');
+const { isGemini4Model } = require('./gemini4-models.cjs');
 const { sanitizeUsage } = require('./usage-capture.cjs');
 
 // Match the host's console body logs without exposing private transport metadata.
@@ -80,7 +81,7 @@ function packTextSignature(parts) {
     return TEXT_PREFIX + Buffer.from(json).toString('base64url');
 }
 async function buildNativeGeminiBody(input, runtime) {
-    if (!/^gemini-4-argon(?:-cyber-permissive)?$/u.test(input.model ?? '')) throw new PluginError(400, 'NATIVE_GEMINI_MODEL_UNSUPPORTED', 'Native Gemini generation requires a Gemini 4 Argon model.');
+    if (!isGemini4Model(input.model)) throw new PluginError(400, 'NATIVE_GEMINI_MODEL_UNSUPPORTED', 'Native Gemini generation requires a supported Gemini 4 model.');
     if (!['makersuite', 'vertexai'].includes(input.chat_completion_source)) throw new PluginError(400, 'NATIVE_GEMINI_SOURCE_UNSUPPORTED', 'Native Gemini generation requires a Google source.');
     if (!Array.isArray(input.messages) || !input.messages.length) throw new PluginError(400, 'INVALID_REQUEST', 'Messages are required.');
     if (!Number.isSafeInteger(input.max_tokens) || input.max_tokens < 1 || input.max_tokens > 1048576) throw new PluginError(400, 'INVALID_REQUEST', 'The output token limit must be between 1 and 1048576.');
@@ -172,7 +173,7 @@ async function buildNativeGeminiBody(input, runtime) {
     }
     return body;
 }
-// Native HTTP has no implicit response-header deadline; Argon may think for many minutes.
+// Native HTTP has no implicit response-header deadline; Gemini 4 may think for many minutes.
 function requestLoopback(url, { method, headers, body, signal, timeoutMs = 31 * 60 * 1000 }) {
     return new Promise((resolve, reject) => {
         const outgoing = http.request(url, { method, headers, signal }, incoming => {

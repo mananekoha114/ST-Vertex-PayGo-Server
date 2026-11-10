@@ -4,8 +4,8 @@ const { StringDecoder } = require('node:string_decoder');
 const { PluginError, asPluginError, errorPayload } = require('./errors.cjs');
 const { sanitizeUsage } = require('./usage-capture.cjs');
 const { validatePreparedGoogleTarget } = require('./target-policy.cjs');
+const { isGemini4Model } = require('./gemini4-models.cjs');
 
-const isGemini4Argon = model => /^gemini-4-argon(?:-cyber-permissive)?$/u.test(model);
 const protocolError = (code, message) => new PluginError(502, code, message);
 const MAX_ERROR_BYTES = 64 * 1024;
 const redact = text => text.replace(/AIza[0-9A-Za-z_-]{35}/gu, '[redacted]').replace(/ya29\.[0-9A-Za-z._-]+/gu, '[redacted]');
@@ -226,4 +226,4 @@ async function runGemini4Transport({ request, response, ticketData, target, upst
         active?.destroy();
     }
 }
-module.exports = { isGemini4Argon, addUsage, runGemini4Transport, writeResponse: write };
+module.exports = { isGemini4Model, addUsage, runGemini4Transport, writeResponse: write };

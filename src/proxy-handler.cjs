@@ -15,7 +15,7 @@ const { PluginError, sendNodeError } = require('./errors.cjs');
 const { describeError } = require('./log-store.cjs');
 const { validatePreparedGoogleTarget } = require('./target-policy.cjs');
 const { UsageCapture } = require('./usage-capture.cjs');
-const { isGemini4Argon, runGemini4Transport } = require('./gemini4-transport.cjs');
+const { isGemini4Model, runGemini4Transport } = require('./gemini4-transport.cjs');
 
 const HOP_BY_HOP_HEADERS = new Set([
     'connection',
@@ -242,7 +242,7 @@ function createProxyHandler({
             // only contain URLs produced by target-policy and cannot be client supplied.
             const target = validatePreparedGoogleTarget(ticketData.targetUrl, ticketData);
 
-            if (isGemini4Argon(ticketData.model)) {
+            if (isGemini4Model(ticketData.model)) {
                 let aggregateUsage;
                 usageCapture = { finish: () => aggregateUsage };
                 runGemini4Transport({

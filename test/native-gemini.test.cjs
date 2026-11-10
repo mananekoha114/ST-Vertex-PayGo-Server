@@ -151,3 +151,12 @@ test('nonstream thought-only MAX_TOKENS fails with the output budget code', asyn
     const res=response();await handler(request({...fixture,...target}),res);
     assert.equal(res.statusCode,502);assert.equal(res.data.error.code,'GEMINI4_OUTPUT_BUDGET_EXHAUSTED');assert.equal(res.data.error.message,res.data.message);
 });
+test('native body accepts every supported Gemini 4 model and rejects others', async () => {
+    for (const model of ['gemini-4-carbon', 'gemini-4-argon', 'gemini-4-argon-cyber-permissive']) {
+        const body = await buildNativeGeminiBody({...fixture, model, chat_completion_source:'vertexai', reasoning_effort:'max'}, runtime);
+        assert.equal(body.generationConfig.thinkingConfig.thinkingLevel, 'HIGH');
+    }
+    for (const model of ['gemini-3.1-pro-preview', 'gemini-4-carbon-preview']) {
+        await assert.rejects(buildNativeGeminiBody({...fixture, model}, runtime), error => error.code === 'NATIVE_GEMINI_MODEL_UNSUPPORTED');
+    }
+});

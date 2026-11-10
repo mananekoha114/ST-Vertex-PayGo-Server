@@ -3,7 +3,7 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { Readable, Writable } = require('node:stream');
 const { EventEmitter } = require('node:events');
-const { runGemini4Transport, isGemini4Argon } = require('../src/gemini4-transport.cjs');
+const { runGemini4Transport, isGemini4Model } = require('../src/gemini4-transport.cjs');
 const { validatePreparedGoogleTarget } = require('../src/target-policy.cjs');
 async function fixture(stream, replies, body = {}, { source = 'vertexai' } = {}) {
     const sent = []; let output = ''; let latest;
@@ -69,8 +69,9 @@ test('missing token does not continue; repeated token fails', async () => {
     await assert.rejects(fixture(false, [value('x', 'CONTINUATION', 'same', 10), value('y', 'CONTINUATION', 'same', 10)]), /continuation limit/u);
 });
 test('model gate and beta target remain tightly scoped', () => {
-    assert.equal(isGemini4Argon('gemini-4-argon-cyber-permissive'), true);
-    assert.equal(isGemini4Argon('gemini-3-pro'), false);
+    for (const model of ['gemini-4-carbon', 'gemini-4-argon', 'gemini-4-argon-cyber-permissive']) assert.equal(isGemini4Model(model), true);
+    for (const model of ['gemini-3-pro', 'gemini-4-carbon-preview', 'gemini-4']) assert.equal(isGemini4Model(model), false);
+    assert.equal(validatePreparedGoogleTarget('https://aiplatform.googleapis.com/v1beta1/publishers/google/models/gemini-4-carbon:generateContent', {model: 'gemini-4-carbon', region: 'global', stream: false}).pathname, '/v1beta1/publishers/google/models/gemini-4-carbon:generateContent');
     assert.throws(() => validatePreparedGoogleTarget('https://aiplatform.googleapis.com/v1beta1/publishers/google/models/gemini-3-pro:generateContent', {model: 'gemini-3-pro', region: 'global', stream: false}));
     assert.throws(() => validatePreparedGoogleTarget('https://evil.test/v1beta1/publishers/google/models/gemini-4-argon:generateContent', {model: 'gemini-4-argon', region: 'global', stream: false}));
 });

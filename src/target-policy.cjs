@@ -9,6 +9,7 @@
 'use strict';
 
 const { PluginError } = require('./errors.cjs');
+const { isGemini4Model } = require('./gemini4-models.cjs');
 
 const ALLOWED_GOOGLE_HEADERS = new Set(['content-type', 'authorization', 'x-goog-api-key']);
 
@@ -44,7 +45,7 @@ function parseAndValidateGoogleTarget(rawUrl, { model, region, stream, source = 
     const expectedPath = aiStudio ? new RegExp(
         `^${proxyBase ? escapeRegularExpression(proxyBase.pathname.replace(/\/+$/u, '')) : ''}/v1(?:beta|alpha)?/models/${escapeRegularExpression(model)}:${endpoint}$`, 'u',
     ) : new RegExp(
-        `^/${/^gemini-4-argon(?:-cyber-permissive)?$/u.test(model) && prepared ? 'v1(?:beta1)?' : 'v1'}/(?:projects/[a-z0-9][a-z0-9-]{0,62}/locations/${escapeRegularExpression(region)}/)?publishers/google/models/${escapeRegularExpression(model)}:${endpoint}$`,
+        `^/${isGemini4Model(model) && prepared ? 'v1(?:beta1)?' : 'v1'}/(?:projects/[a-z0-9][a-z0-9-]{0,62}/locations/${escapeRegularExpression(region)}/)?publishers/google/models/${escapeRegularExpression(model)}:${endpoint}$`,
         'u',
     );
 

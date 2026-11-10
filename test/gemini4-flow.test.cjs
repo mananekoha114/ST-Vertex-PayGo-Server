@@ -10,6 +10,7 @@ const { PassThrough } = require('node:stream');
 const { createLoopbackTransport } = require('../src/loopback-server.cjs');
 const { TicketStore } = require('../src/ticket-store.cjs');
 const { createNativeGeminiHandler, buildNativeGeminiBody } = require('../src/native-gemini.cjs');
+const { GEMINI4_MODELS } = require('../src/gemini4-models.cjs');
 
 const workspace = path.resolve(__dirname, '../..');
 const hostRoot = path.join(workspace, 'SillyTavern-1.18.0');
@@ -34,8 +35,8 @@ function nativeHost() {
     }) } };
 }
 
-for (const source of ['makersuite', 'vertexai']) for (const stream of [false, true]) {
-    test(`native Argon full flow: frontend -> authenticated route -> ticket -> two mock hops -> ST parser (${source}, stream=${stream})`, { skip: !available }, async () => {
+for (const model of ['gemini-4-argon', 'gemini-4-carbon']) for (const source of ['makersuite', 'vertexai']) for (const stream of [false, true]) {
+    test(`native Gemini 4 full flow: frontend -> authenticated route -> ticket -> two mock hops -> ST parser (${model}, ${source}, stream=${stream})`, { skip: !available }, async () => {
         const { installRequestTransport } = await import(pathToFileURL(frontEntry));
         const { sandbox, runtime } = nativeHost();
         const store = new TicketStore();
@@ -78,17 +79,19 @@ for (const source of ['makersuite', 'vertexai']) for (const stream of [false, tr
         await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
         const origin = `http://127.0.0.1:${server.address().port}`;
         try {
-            const model = 'gemini-4-argon';
             const endpoint = stream ? 'streamGenerateContent' : 'generateContent';
+            // Vertex Flex PayGo does not serve Gemini 4; AI Studio Flex keeps its service_tier rewrite covered.
+            const tier = source === 'vertexai' ? 'standard' : 'flex';
             const targetUrl = source === 'vertexai'
                 ? `https://aiplatform.googleapis.com/v1/projects/demo/locations/global/publishers/google/models/${model}:${endpoint}${stream ? '?alt=sse' : ''}`
                 : `https://generativelanguage.googleapis.com/v1beta/models/${model}:${endpoint}${stream ? '?alt=sse' : ''}`;
-            const ticket = store.create({ source, model, stream, endpoint, tier: 'flex', region: source === 'vertexai' ? 'global' : undefined,
+            const ticket = store.create({ source, model, stream, endpoint, tier, region: source === 'vertexai' ? 'global' : undefined,
                 targetUrl, headers: { 'Content-Type': 'application/json', Authorization: 'Bearer mock-google-only' }, usageReference: { file: 'fixture', id: 'usage' } });
             const target = { location: { origin }, fetch: globalThis.fetch };
-            installRequestTransport({ target, context: {}, origin, stateProvider: () => ({ tier: 'flex', paygoOnly: false }),
+            installRequestTransport({ target, context: {}, origin, stateProvider: () => ({ tier, paygoOnly: false }),
                 serverClient: { prepare: async () => ({ proxyUrl: `${transport.baseUrl}/proxy/${ticket.ticket}`,
-                    proxySecret: ticket.proxySecret, nativeGemini4: true, nativeGeminiApiVersion: 'v1beta' }) } });
+                    proxySecret: ticket.proxySecret, nativeGemini4: true, nativeGeminiApiVersion: 'v1beta',
+                    nativeGemini4Models: [...GEMINI4_MODELS] }) } });
             const response = await target.fetch(`${origin}/api/backends/chat-completions/generate`, { method: 'POST',
                 headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ model, stream, chat_completion_source: source,
                     vertexai_auth_mode: 'express', vertexai_region: 'global', max_tokens: 64, include_reasoning: true,

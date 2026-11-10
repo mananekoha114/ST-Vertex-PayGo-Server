@@ -14,6 +14,7 @@ const { sendExpressError, PluginError } = require('./errors.cjs');
 const { describeError } = require('./log-store.cjs');
 const { PLUGIN_ID, PROTOCOL_VERSION, validatePreparePayload } = require('./protocol.cjs');
 const { prepareGoogleHeaders, prepareGoogleTarget } = require('./target-policy.cjs');
+const { GEMINI4_MODELS } = require('./gemini4-models.cjs');
 const EXPLICIT_SECRET_ERROR_CODES = new Set([
     'EXPLICIT_SECRET_UNSUPPORTED',
     'EXPLICIT_SECRET_NOT_FOUND',
@@ -151,6 +152,7 @@ function createPrepareHandler({ stRuntime, ticketStore, loopbackTransport, logSt
                 pluginId: PLUGIN_ID,
                 transport: 'loopback-http',
                 nativeGemini4: true,
+                nativeGemini4Models: [...GEMINI4_MODELS],
                 nativeGeminiApiVersion: config.source === 'makersuite'
                     ? new URL(targetUrl).pathname.match(/\/(v1(?:beta|alpha)?)\/models\/[^/]+$/u)[1]
                     : new URL(targetUrl).pathname.split('/')[1],
