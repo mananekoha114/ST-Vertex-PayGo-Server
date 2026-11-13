@@ -48,10 +48,14 @@ test('prepare protocol accepts a canonical Vertex Gemini request', () => {
     });
 });
 
-test('prepare protocol fails closed on non-Gemini, regional premium tier, and proxy fields', () => {
+test('prepare protocol fails closed on non-Gemini and regional premium tier, with or without a proxy', () => {
     assert.throws(() => validatePreparePayload(validBody({ model: 'claude-sonnet-4' })), { code: 'INVALID_PREPARE_REQUEST' });
     assert.throws(() => validatePreparePayload(validBody({ vertexai_region: 'us-central1' })), { code: 'GLOBAL_REGION_REQUIRED' });
-    assert.throws(() => validatePreparePayload(validBody({ reverse_proxy: 'https://example.test' })), { code: 'UPSTREAM_PROXY_UNSUPPORTED' });
+    assert.throws(() => validatePreparePayload(validBody({ vertexai_region: 'us-central1', reverse_proxy: 'https://example.test' })),
+        { code: 'GLOBAL_REGION_REQUIRED' });
+    assert.deepEqual(validatePreparePayload(validBody({ reverse_proxy: 'https://example.test/', proxy_password: 'key' })), {
+        ...validatePreparePayload(validBody()), reverseProxy: 'https://example.test', proxyPassword: 'key',
+    });
     assert.equal(validatePreparePayload(validBody({ tier: 'standard', paygoOnly: false })).tier, 'standard');
 });
 

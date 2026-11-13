@@ -164,7 +164,7 @@ SillyTavern 与 Luker 原生请求管道并未对外暴露 Google 专有的 PayG
 
 1. **预检与鉴权校验**：前端发起会话生成前，首先调用后端的 `/api/plugins/vertex-paygo/prepare` 预检端点。
 2. **凭据预留与签发**：插件在内部按用户校验模型、区域与层级后，在总并发池与单用户限额内预留票据槽位，从宿主提取对应用户的认证信息。成功后签发一张**5分钟有效期、单次核销作废**的一次性票据（Ticket）及随机 Bearer Token，并回传专有的本地回环监听端点。
-3. **中继与参数重组**：宿主向该本地地址发起实际生成请求，插件校验请求合法性后立刻核销票据，按所选层级追加参数并直接向 Google 官方接口流式转发。Standard 不追加 PayGo-only、Flex 或 Priority 参数，也不改变认证方式和区域。
+3. **中继与参数重组**：宿主向该本地地址发起实际生成请求，插件校验请求合法性后立刻核销票据，按所选层级追加参数，带 `Content-Length` 转发给 Google 官方接口或宿主中填写的反向代理，响应保持流式。Standard 不追加 PayGo-only、Flex 或 Priority 参数，也不改变认证方式和区域。
 4. **用量记录**：插件在不阻塞响应的情况下解析 SSE 或 JSON 的累计 `usageMetadata`。解析失败、响应过大或压缩响应不会破坏原始响应，而会把记录标为 `incomplete`。
 
 *(注：代理接口严格限定本地回环 `127.0.0.1` 访问，即使宿主部署于云端服务器，外部网络也无法穿透访问代理端口，从架构层面杜绝滥用。)*
@@ -191,6 +191,15 @@ Google AI Studio 的 Standard 与 Flex 模式复用相同的预检机制、鉴�
 - **Standard 原样转发**：请求体原样转发，不添加服务层级参数；
 - **流式透传**：下行数据继续保持无损流式响应（SSE），复用 `X-Server-Timeout: 1800` 等超时防护；
 - **规则限制**：不注入 Vertex 专属标头。AI Studio 下任何附带 Priority 或 PayGo-only 的组合均会在预检阶段被直接拦截拒绝。
+
+### 3. 宿主反向代理（AI Studio / Vertex AI）
+宿主 API 设置中填写了反向代理时，两种来源都改为转发到该反代，票据绑定反代的完整 origin 与路径前缀：
+- **与原生请求一致**：路径沿用宿主生成的结果（AI Studio 为 `{反代}/{版本}/models/...`，Vertex 为 `{反代}/v1/publishers/google/models/...`）。AI Studio 的代理密码作为第一个查询参数 `?key=` 发送（为空时同样发送），Vertex 使用宿主给出的 `Authorization: Bearer`。`User-Agent` 与 `Accept` 沿用宿主调用回环时的取值，缺失时补 node-fetch 默认值；不发送 `Accept-Encoding`，以便采集用量。
+- **请求体整体发送**：所有请求先在尺寸上限内读完请求体，再带 `Content-Length` 发出，不使用分块上传。部分反代会拒绝分块请求，或为其预留全部请求体上限，导致并发请求被拒。
+- **凭据**：代理启用时由宿主决定凭据，插件不改用 Google 官方密钥。Luker 的 AI Studio 在代理密码为空时按宿主逻辑回退到已保存的密钥，插件照样转发。
+- **模型名**：以 `gemini-` 开头（不分大小写）且不含 `/ \ ? # %`、空白或控制字符的名称均可交给反代，最长 256 个字符；官方端点仍只接受官方模型 ID。
+- **层级参数**：与官方端点相同。Vertex 的 Flex / Priority 仍要求区域为 `global`，反代需透传 `X-Vertex-AI-*` 请求头；Vertex 上的 Gemini 4 只改写反代基址之后的版本段为 `v1beta1`。
+- **错误处理**：不跟随 3xx 重定向；Gemini 4 通道的上游错误信息会隐去代理密码。
 
 ## 对话用量账本
 
@@ -248,9 +257,9 @@ Gemini 4（`gemini-4-hydrogen`、`gemini-4-carbon`、`gemini-4-argon` 与 `gemin
 ## 明确不支持的使用场景
 
 - ❌ 非 Gemini 系列的模型（如 Vertex 内托管的 Claude、Llama、Mistral 等）。
-- ❌ 非 Google 官方接口（任何第三方中转/中继 API）。
+- ❌ 不兼容 Gemini 原生接口的第三方中转/中继 API；宿主反向代理须提供与 Google 相同的路径与格式。
 - ❌ 将 Flex / Priority 与具体区域节点（Regional Endpoints）混用。
-- ❌ Vertex 自定义反代；AI Studio 原生通道支持宿主填写的反代地址与代理密码。
+- ❌ 在插件中另行配置上游地址；反向代理只读取宿主 API 设置中的地址与代理密码。
 - ❌ 将本插件的回环端口暴露给公网，作为多人共用的公开反代服务。
 
 ---

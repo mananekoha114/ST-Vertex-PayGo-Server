@@ -10,12 +10,13 @@
 
 const https = require('node:https');
 const http = require('node:http');
-const { Transform } = require('node:stream');
+const { readBoundedStream } = require('./bounded-buffer.cjs');
 const { PluginError, sendNodeError } = require('./errors.cjs');
 const { describeError } = require('./log-store.cjs');
 const { validatePreparedGoogleTarget } = require('./target-policy.cjs');
 const { UsageCapture } = require('./usage-capture.cjs');
 const { isGemini4Model, runGemini4Transport } = require('./gemini4-transport.cjs');
+const { buildUpstreamRequest, encodedModelSegment } = require('./upstream-proxy.cjs');
 
 const HOP_BY_HOP_HEADERS = new Set([
     'connection',
@@ -28,57 +29,25 @@ const HOP_BY_HOP_HEADERS = new Set([
     'upgrade',
 ]);
 
-class ByteLimitTransform extends Transform {
-    constructor(limit) {
-        super();
-        this.limit = limit;
-        this.total = 0;
-    }
-
-    _transform(chunk, encoding, callback) {
-        this.total += chunk.length;
-        if (this.total > this.limit) {
-            callback(new PluginError(413, 'REQUEST_BODY_TOO_LARGE', 'The proxied Vertex AI request body is too large.'));
-            return;
-        }
-        callback(null, chunk);
-    }
+// Some servers reject chunked uploads or reserve their whole body limit for
+// them, so the request body is read first and always sent with its length.
+async function readRequestBody(request, maxBodyBytes) {
+    const body = await readBoundedStream(request, maxBodyBytes);
+    if (!body) throw new PluginError(413, 'REQUEST_BODY_TOO_LARGE', 'The proxied Google request body is too large.');
+    return body;
 }
 
-// Reuse the bounded request stream, buffering only AI Studio JSON because its
-// service tier belongs in the body. Responses still stream without buffering.
-class FlexBodyTransform extends ByteLimitTransform {
-    constructor(limit) {
-        super(limit);
-        this.chunks = [];
+// AI Studio takes its service tier in the body. Remove both spellings so an
+// existing tier cannot override the ticket.
+function withFlexServiceTier(body) {
+    let value;
+    try { value = JSON.parse(body.toString('utf8')); } catch { /* Rejected below. */ }
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+        throw new PluginError(400, 'INVALID_GOOGLE_BODY', 'The Google AI Studio request must be a JSON object.');
     }
-
-    _transform(chunk, encoding, callback) {
-        super._transform(chunk, encoding, (error, data) => {
-            if (error) return callback(error);
-            this.chunks.push(data);
-            callback();
-        });
-    }
-
-    _flush(callback) {
-        try {
-            const body = JSON.parse(Buffer.concat(this.chunks).toString('utf8'));
-            this.chunks = [];
-            if (!body || typeof body !== 'object' || Array.isArray(body)) throw new Error('Not an object');
-            // Remove both spellings so an existing tier cannot override the ticket.
-            delete body.serviceTier;
-            body.service_tier = 'flex';
-            callback(null, JSON.stringify(body));
-        } catch {
-            callback(new PluginError(400, 'INVALID_GOOGLE_BODY', 'The Google AI Studio request must be a JSON object.'));
-        }
-    }
-
-    _destroy(error, callback) {
-        this.chunks = [];
-        callback(error);
-    }
+    delete value.serviceTier;
+    value.service_tier = 'flex';
+    return Buffer.from(JSON.stringify(value));
 }
 
 function getBearerSecret(header) {
@@ -117,7 +86,7 @@ function validateSuffix(parsed, modelAction, ticketData) {
     }
     const aiStudio = ticketData.source === 'makersuite';
     const expectedSuffix = aiStudio ? new URL(ticketData.targetUrl).pathname.match(/\/v1(?:beta|alpha)?\/models\/[^/]+$/u)?.[0]
-        : `/v1/publishers/google/models/${ticketData.model}:${ticketData.endpoint}`;
+        : `/v1/publishers/google/models/${encodedModelSegment(ticketData.model)}:${ticketData.endpoint}`;
     if (!expectedSuffix || !parsed.pathname.endsWith(expectedSuffix)) {
         throw new PluginError(409, 'PROXY_REQUEST_MISMATCH', 'The proxy provider or API version does not match its ticket.');
     }
@@ -156,7 +125,6 @@ function createProxyHandler({
     return function proxyHandler(request, response) {
         const startedAt = Date.now();
         let upstream;
-        let bodyStream;
         let logContext;
         let failureHandled = false;
         let clientGone = false;
@@ -193,7 +161,6 @@ function createProxyHandler({
             finalizeUsage('failed', error?.code || 'VERTEX_UPSTREAM_FAILED', usageCapture?.finish());
             logTerminal('error', 'proxy_failed', describeError(error));
             upstream?.destroy();
-            bodyStream?.destroy();
             sendNodeError(response, error);
         };
 
@@ -210,7 +177,7 @@ function createProxyHandler({
             }
             const declaredLength = Number(request.headers['content-length']);
             if (Number.isFinite(declaredLength) && declaredLength > maxBodyBytes) {
-                throw new PluginError(413, 'REQUEST_BODY_TOO_LARGE', 'The proxied Vertex AI request body is too large.');
+                throw new PluginError(413, 'REQUEST_BODY_TOO_LARGE', 'The proxied Google request body is too large.');
             }
 
             const { parsed, ticket, modelAction, source } = parseProxyPath(request.url);
@@ -259,81 +226,12 @@ function createProxyHandler({
                 return;
             }
 
-            upstream = upstreamRequest(target, {
-                method: 'POST',
-                headers: ticketData.headers,
-                // node:https does not follow redirects and has no implicit fetch-style
-                // response-header timeout, which is required for long Flex requests.
-            }, upstreamResponse => {
-                if (response.writableEnded) {
-                    clientGone = true;
-                    finalizeUsage('incomplete', 'CLIENT_DISCONNECTED', usageCapture?.finish());
-                    logTerminal('warn', 'proxy_client_disconnected');
-                    upstreamResponse.destroy();
-                    return;
-                }
-                const statusCode = upstreamResponse.statusCode || 502;
-                if (statusCode >= 300 && statusCode < 400) {
-                    // Relaying Location would let SillyTavern's outer node-fetch follow
-                    // the redirect after it leaves this allowlisted transport.
-                    upstreamResponse.destroy();
-                    fail(new PluginError(502, 'VERTEX_REDIRECT_REJECTED', 'The Vertex AI upstream returned a redirect, which was not followed.'));
-                    return;
-                }
-                const responseHeaders = copyUpstreamHeaders(upstreamResponse.headers);
-                if (upstreamResponse.statusMessage) {
-                    response.writeHead(statusCode, upstreamResponse.statusMessage, responseHeaders);
-                } else {
-                    response.writeHead(statusCode, responseHeaders);
-                }
-                logStore?.server(statusCode >= 400 ? 'warn' : 'info', 'proxy_upstream_response', makeLogContext({ statusCode }));
-                const encoding = upstreamResponse.headers?.['content-encoding'];
-                const compressed = Boolean(encoding && String(encoding).toLowerCase() !== 'identity');
-                if (!compressed) {
-                    usageCapture = new UsageCapture({ stream: ticketData.stream });
-                    upstreamResponse.on('data', chunk => {
-                        try { usageCapture.write(chunk); } catch { /* Usage capture is observational. */ }
-                    });
-                }
-                upstreamResponse.once('end', () => {
-                    const usage = usageCapture?.finish() || null;
-                    if (statusCode >= 400) finalizeUsage('failed', `UPSTREAM_HTTP_${statusCode}`, usage);
-                    else if (usageCapture?.limitExceeded) finalizeUsage('incomplete', 'USAGE_CAPTURE_LIMIT', usage);
-                    else if (usage) finalizeUsage('complete', undefined, usage);
-                    else finalizeUsage('incomplete', compressed ? 'USAGE_COMPRESSED_RESPONSE'
-                        : usageCapture?.limitExceeded ? 'USAGE_CAPTURE_LIMIT' : 'USAGE_METADATA_MISSING');
-                });
-                upstreamResponse.on('error', error => {
-                    failureHandled = true;
-                    finalizeUsage('incomplete', 'UPSTREAM_RESPONSE_STREAM_FAILED', usageCapture?.finish());
-                    logTerminal('error', 'proxy_response_stream_failed', describeError(error));
-                    response.destroy();
-                });
-                response.once('finish', () => {
-                    logTerminal(statusCode >= 400 ? 'warn' : 'info', 'proxy_completed', { statusCode });
-                });
-                upstreamResponse.pipe(response);
-            });
-            logStore?.server('info', 'proxy_forward_started', makeLogContext());
-            upstream.setTimeout?.(upstreamTimeoutMs, () => {
-                fail(new PluginError(504, 'VERTEX_UPSTREAM_TIMEOUT', 'The Vertex AI upstream request timed out.'));
-            });
-
-            bodyStream = ticketData.source === 'makersuite' && ticketData.tier === 'flex'
-                ? new FlexBodyTransform(maxBodyBytes) : new ByteLimitTransform(maxBodyBytes);
-            bodyStream.on('error', fail);
-            upstream.on('error', error => {
-                fail(error instanceof PluginError
-                    ? error
-                    : new PluginError(502, 'VERTEX_UPSTREAM_FAILED', 'The Vertex AI upstream connection failed.', { cause: error }));
-            });
             request.once('aborted', () => {
                 if (clientGone) return;
                 clientGone = true;
                 finalizeUsage('incomplete', 'CLIENT_DISCONNECTED', usageCapture?.finish());
                 logTerminal('warn', 'proxy_client_disconnected');
-                upstream.destroy();
-                bodyStream.destroy();
+                upstream?.destroy();
             });
             request.once('error', error => {
                 fail(new PluginError(400, 'PROXY_REQUEST_STREAM_FAILED', 'The loopback request stream failed.', { cause: error }));
@@ -343,11 +241,79 @@ function createProxyHandler({
                     clientGone = true;
                     finalizeUsage('incomplete', 'CLIENT_DISCONNECTED', usageCapture?.finish());
                     logTerminal('warn', 'proxy_client_disconnected');
-                    upstream.destroy();
-                    bodyStream.destroy();
+                    upstream?.destroy();
                 }
             });
-            request.pipe(bodyStream).pipe(upstream);
+            readRequestBody(request, maxBodyBytes).then(body => {
+                if (clientGone || failureHandled) return;
+                const payload = ticketData.source === 'makersuite' && ticketData.tier === 'flex' ? withFlexServiceTier(body) : body;
+                const { url, headers } = buildUpstreamRequest(target, ticketData, request.headers);
+                upstream = upstreamRequest(url, {
+                    method: 'POST',
+                    headers: { ...headers, 'Content-Length': payload.length },
+                    // node:https does not follow redirects and has no implicit fetch-style
+                    // response-header timeout, which is required for long Flex requests.
+                }, upstreamResponse => {
+                    if (response.writableEnded) {
+                        clientGone = true;
+                        finalizeUsage('incomplete', 'CLIENT_DISCONNECTED', usageCapture?.finish());
+                        logTerminal('warn', 'proxy_client_disconnected');
+                        upstreamResponse.destroy();
+                        return;
+                    }
+                    const statusCode = upstreamResponse.statusCode || 502;
+                    if (statusCode >= 300 && statusCode < 400) {
+                        // Relaying Location would let SillyTavern's outer node-fetch follow
+                        // the redirect after it leaves this allowlisted transport.
+                        upstreamResponse.destroy();
+                        fail(new PluginError(502, 'VERTEX_REDIRECT_REJECTED', 'The Vertex AI upstream returned a redirect, which was not followed.'));
+                        return;
+                    }
+                    const responseHeaders = copyUpstreamHeaders(upstreamResponse.headers);
+                    if (upstreamResponse.statusMessage) {
+                        response.writeHead(statusCode, upstreamResponse.statusMessage, responseHeaders);
+                    } else {
+                        response.writeHead(statusCode, responseHeaders);
+                    }
+                    logStore?.server(statusCode >= 400 ? 'warn' : 'info', 'proxy_upstream_response', makeLogContext({ statusCode }));
+                    const encoding = upstreamResponse.headers?.['content-encoding'];
+                    const compressed = Boolean(encoding && String(encoding).toLowerCase() !== 'identity');
+                    if (!compressed) {
+                        usageCapture = new UsageCapture({ stream: ticketData.stream });
+                        upstreamResponse.on('data', chunk => {
+                            try { usageCapture.write(chunk); } catch { /* Usage capture is observational. */ }
+                        });
+                    }
+                    upstreamResponse.once('end', () => {
+                        const usage = usageCapture?.finish() || null;
+                        if (statusCode >= 400) finalizeUsage('failed', `UPSTREAM_HTTP_${statusCode}`, usage);
+                        else if (usageCapture?.limitExceeded) finalizeUsage('incomplete', 'USAGE_CAPTURE_LIMIT', usage);
+                        else if (usage) finalizeUsage('complete', undefined, usage);
+                        else finalizeUsage('incomplete', compressed ? 'USAGE_COMPRESSED_RESPONSE'
+                            : usageCapture?.limitExceeded ? 'USAGE_CAPTURE_LIMIT' : 'USAGE_METADATA_MISSING');
+                    });
+                    upstreamResponse.on('error', error => {
+                        failureHandled = true;
+                        finalizeUsage('incomplete', 'UPSTREAM_RESPONSE_STREAM_FAILED', usageCapture?.finish());
+                        logTerminal('error', 'proxy_response_stream_failed', describeError(error));
+                        response.destroy();
+                    });
+                    response.once('finish', () => {
+                        logTerminal(statusCode >= 400 ? 'warn' : 'info', 'proxy_completed', { statusCode });
+                    });
+                    upstreamResponse.pipe(response);
+                });
+                logStore?.server('info', 'proxy_forward_started', makeLogContext());
+                upstream.setTimeout?.(upstreamTimeoutMs, () => {
+                    fail(new PluginError(504, 'VERTEX_UPSTREAM_TIMEOUT', 'The Vertex AI upstream request timed out.'));
+                });
+                upstream.on('error', error => {
+                    fail(error instanceof PluginError
+                        ? error
+                        : new PluginError(502, 'VERTEX_UPSTREAM_FAILED', 'The Vertex AI upstream connection failed.', { cause: error }));
+                });
+                upstream.end(payload);
+            }).catch(fail);
         } catch (error) {
             fail(error);
         }
@@ -355,7 +321,6 @@ function createProxyHandler({
 }
 
 module.exports = {
-    ByteLimitTransform,
     copyUpstreamHeaders,
     createProxyHandler,
     parseProxyPath,

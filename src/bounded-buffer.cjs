@@ -37,4 +37,33 @@ class BoundedBuffer {
     }
 }
 
-module.exports = { BoundedBuffer };
+// Collect a whole stream within a byte limit. Input beyond the limit is
+// discarded instead of destroying the stream, so an HTTP request can still
+// receive its error response. Resolves null when the limit was exceeded.
+function readBoundedStream(stream, limit) {
+    return new Promise((resolve, reject) => {
+        const buffer = new BoundedBuffer(limit);
+        const settle = (error, value) => {
+            stream.off('data', onData);
+            stream.off('end', onEnd);
+            stream.off('error', onError);
+            stream.off('close', onClose);
+            if (error) reject(error);
+            else resolve(value);
+        };
+        const onData = chunk => {
+            if (buffer.append(chunk)) return;
+            settle(null, null);
+            stream.resume();
+        };
+        const onEnd = () => settle(null, buffer.toBuffer());
+        const onError = error => settle(error);
+        const onClose = () => settle(new Error('The stream closed before it ended.'));
+        stream.on('data', onData);
+        stream.once('end', onEnd);
+        stream.once('error', onError);
+        stream.once('close', onClose);
+    });
+}
+
+module.exports = { BoundedBuffer, readBoundedStream };
