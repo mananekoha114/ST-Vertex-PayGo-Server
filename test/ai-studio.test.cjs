@@ -17,7 +17,7 @@ const { validatePreparePayload } = require('../src/protocol.cjs');
 const { prepareGoogleTarget } = require('../src/target-policy.cjs');
 
 const model = 'gemini-2.5-pro';
-const prepareBody = overrides => ({ protocolVersion: 2, chat_completion_source: 'makersuite', model, stream: true, tier: 'flex', paygoOnly: false, ...overrides });
+const prepareBody = overrides => ({ protocolVersion: 3, chat_completion_source: 'makersuite', model, stream: true, tier: 'flex', paygoOnly: false, ...overrides });
 
 test('AI Studio protocol accepts only Flex, independently of Vertex configuration', () => {
     const config = validatePreparePayload(prepareBody());

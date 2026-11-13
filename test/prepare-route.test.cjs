@@ -26,7 +26,7 @@ function makeResponse() {
 
 function makeBody(overrides = {}) {
     return {
-        protocolVersion: 2,
+        protocolVersion: 3,
         chat_completion_source: 'vertexai',
         model: 'gemini-2.5-pro',
         stream: true,

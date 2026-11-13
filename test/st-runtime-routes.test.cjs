@@ -208,7 +208,7 @@ test('route registration exposes handshake, prepare, and fail-closed sink', () =
     };
     routes.get[0].handler({ user: { profile: { admin: true } } }, response);
     assert.equal(response.body.ok, true);
-    assert.equal(response.body.protocolVersion, 2);
+    assert.equal(response.body.protocolVersion, 3);
     assert.equal(response.body.transport, 'loopback-http');
     assert.equal(response.body.pluginVersion, '0.6.1-pre1');
     assert.equal(response.body.sillyTavern.compatibleRange, '>=1.16.0');

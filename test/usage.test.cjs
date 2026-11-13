@@ -164,7 +164,7 @@ test('usage ledger caches its folded JSONL index and times out live pending reco
 test('Standard is proxied for both Google sources without tier headers or body policy', () => {
     for (const source of ['vertexai', 'makersuite']) {
         const config = validatePreparePayload({
-            protocolVersion: 2, chat_completion_source: source, model: 'gemini-2.5-flash', stream: false,
+            protocolVersion: 3, chat_completion_source: source, model: 'gemini-2.5-flash', stream: false,
             tier: 'standard', paygoOnly: false,
             ...(source === 'vertexai' ? { vertexai_auth_mode: 'full', vertexai_region: 'us-central1' } : {}),
         });
@@ -175,14 +175,14 @@ test('Standard is proxied for both Google sources without tier headers or body p
 
 test('usage price and chat identifiers are validated and snapshotted', () => {
     const config = validatePreparePayload({
-        protocolVersion: 2, chat_completion_source: 'vertexai', model: 'gemini-2.5-pro', stream: true,
+        protocolVersion: 3, chat_completion_source: 'vertexai', model: 'gemini-2.5-pro', stream: true,
         tier: 'standard', paygoOnly: false, vertexai_auth_mode: 'full', vertexai_region: 'global',
         usageChatId: '123e4567-e89b-12d3-a456-426614174000',
         usagePrice: { input: 1.25, cachedInput: 0.2, output: 10, longContextThreshold: 200000, longInput: 2.5, longCachedInput: 0.4, longOutput: 15 },
     });
     assert.equal(config.usagePrice.longOutput, 15);
     const thresholdOnly = validatePreparePayload({
-        protocolVersion: 2, chat_completion_source: 'vertexai', model: 'gemini-2.5-pro', stream: false,
+        protocolVersion: 3, chat_completion_source: 'vertexai', model: 'gemini-2.5-pro', stream: false,
         tier: 'standard', paygoOnly: false, vertexai_auth_mode: 'full', vertexai_region: 'global',
         usagePrice: { input: 1, cachedInput: 0.1, output: 3, longContextThreshold: 200000 },
     });

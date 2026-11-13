@@ -10,7 +10,7 @@ const { loadStRuntime } = require('../src/st-runtime.cjs');
 const { validatePreparePayload } = require('../src/protocol.cjs');
 const { prepareGoogleTarget, validatePreparedGoogleTarget } = require('../src/target-policy.cjs');
 
-const body = overrides => ({ protocolVersion: 2, chat_completion_source: 'makersuite', model: 'gemini-2.5-pro',
+const body = overrides => ({ protocolVersion: 3, chat_completion_source: 'makersuite', model: 'gemini-2.5-pro',
     stream: false, tier: 'flex', paygoOnly: false, ...overrides });
 const response = () => ({ statusCode: 200, set() {}, status(code) { this.statusCode = code; return this; }, json(value) { this.body = value; } });
 

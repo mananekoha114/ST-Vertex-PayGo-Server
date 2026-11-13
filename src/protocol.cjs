@@ -10,7 +10,7 @@
 
 const { PluginError } = require('./errors.cjs');
 
-const PROTOCOL_VERSION = 2;
+const PROTOCOL_VERSION = 3;
 const PLUGIN_ID = 'vertex-paygo';
 const PLUGIN_VERSION = '0.6.1-pre1';
 const COMPATIBLE_ST_RANGE = '>=1.16.0';
