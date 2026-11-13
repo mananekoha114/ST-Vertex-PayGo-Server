@@ -10,11 +10,16 @@
 
 const { PluginError } = require('./errors.cjs');
 const { isGemini4Model } = require('./gemini4-models.cjs');
+const { encodedModelSegment } = require('./upstream-proxy.cjs');
 
 const ALLOWED_GOOGLE_HEADERS = new Set(['content-type', 'authorization', 'x-goog-api-key']);
 
 function escapeRegularExpression(value) {
     return value.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
+}
+
+function vertexResourcePattern(region) {
+    return `(?:projects/[a-z0-9][a-z0-9-]{0,62}/locations/${escapeRegularExpression(region)}/)?`;
 }
 
 function parseAndValidateGoogleTarget(rawUrl, { model, region, stream, source = 'vertexai', reverseProxy }, prepared) {
@@ -26,28 +31,30 @@ function parseAndValidateGoogleTarget(rawUrl, { model, region, stream, source = 
     }
 
     const aiStudio = source === 'makersuite';
-    // A ticket may use only the exact base selected for this Studio request.
-    // Official requests and Vertex retain their provider allowlist.
+    // A ticket may use only the exact base selected for this request. Official
+    // requests retain their provider allowlist.
     let proxyBase;
-    if (aiStudio && reverseProxy) {
+    if (reverseProxy) {
         try {
             proxyBase = new URL(reverseProxy);
             if (!['http:', 'https:'].includes(proxyBase.protocol) || proxyBase.username || proxyBase.password
                 || proxyBase.search || proxyBase.hash) throw new Error();
         } catch {
-            throw new PluginError(500, 'UNSAFE_GOOGLE_TARGET', 'The stored AI Studio proxy base failed validation.');
+            throw new PluginError(500, 'UNSAFE_GOOGLE_TARGET', 'The stored reverse proxy base failed validation.');
         }
     }
     const expectedHost = aiStudio ? 'generativelanguage.googleapis.com' : region === 'global'
         ? 'aiplatform.googleapis.com'
         : `${region}-aiplatform.googleapis.com`;
     const endpoint = stream ? 'streamGenerateContent' : 'generateContent';
-    const expectedPath = aiStudio ? new RegExp(
-        `^${proxyBase ? escapeRegularExpression(proxyBase.pathname.replace(/\/+$/u, '')) : ''}/v1(?:beta|alpha)?/models/${escapeRegularExpression(model)}:${endpoint}$`, 'u',
-    ) : new RegExp(
-        `^/${isGemini4Model(model) && prepared ? 'v1(?:beta1)?' : 'v1'}/(?:projects/[a-z0-9][a-z0-9-]{0,62}/locations/${escapeRegularExpression(region)}/)?publishers/google/models/${escapeRegularExpression(model)}:${endpoint}$`,
-        'u',
-    );
+    const prefix = proxyBase ? escapeRegularExpression(proxyBase.pathname.replace(/\/+$/u, '')) : '';
+    const modelSegment = escapeRegularExpression(encodedModelSegment(model));
+    // Gemini 4 on Vertex is sent to v1beta1 after the ticket was prepared, and
+    // SillyTavern sends a Vertex proxy request without project or location.
+    const vertexVersion = isGemini4Model(model) && prepared ? 'v1(?:beta1)?' : 'v1';
+    const expectedPath = aiStudio
+        ? new RegExp(`^${prefix}/v1(?:beta|alpha)?/models/${modelSegment}:${endpoint}$`, 'u')
+        : new RegExp(`^${prefix}/${vertexVersion}/${proxyBase ? '' : vertexResourcePattern(region)}publishers/google/models/${modelSegment}:${endpoint}$`, 'u');
 
     if (
         (proxyBase ? target.origin !== proxyBase.origin : target.protocol !== 'https:' || target.hostname !== expectedHost || target.port !== '')

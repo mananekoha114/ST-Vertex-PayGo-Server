@@ -9,6 +9,7 @@
 'use strict';
 
 const { PluginError } = require('./errors.cjs');
+const { isProxyModel, validateReverseProxy } = require('./upstream-proxy.cjs');
 
 const PROTOCOL_VERSION = 3;
 const PLUGIN_ID = 'vertex-paygo';
@@ -76,30 +77,17 @@ function validatePreparePayload(body) {
     if (!['vertexai', 'makersuite'].includes(source)) {
         throw new PluginError(400, 'GOOGLE_ONLY', 'Only the Vertex AI and Google AI Studio sources are supported.');
     }
-    if (source !== 'makersuite' && (Object.hasOwn(body, 'reverse_proxy') || Object.hasOwn(body, 'proxy_password'))) {
-        throw new PluginError(400, 'UPSTREAM_PROXY_UNSUPPORTED', 'Existing reverse-proxy settings are not accepted by this transport.');
+    const upstreamProxy = validateReverseProxy(body);
+    // Official endpoints accept only canonical Google model IDs. A reverse proxy
+    // receives whatever Gemini-prefixed name SillyTavern would send it natively.
+    let model;
+    if (!upstreamProxy) {
+        model = requireCanonicalString(body.model, 'model', /^gemini-[a-z0-9][a-z0-9._-]*$/u);
+    } else if (isProxyModel(body.model)) {
+        model = body.model;
+    } else {
+        throw new PluginError(400, 'INVALID_PREPARE_REQUEST', 'Invalid model.');
     }
-    let reverseProxy;
-    let proxyPassword;
-    if (Object.hasOwn(body, 'reverse_proxy')) {
-        try {
-            if (typeof body.reverse_proxy !== 'string' || !body.reverse_proxy || body.reverse_proxy.length > 4096
-                || body.reverse_proxy.trim() !== body.reverse_proxy || /[\s\\]/u.test(body.reverse_proxy)) throw new Error();
-            const url = new URL(body.reverse_proxy);
-            if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) throw new Error();
-            reverseProxy = url.toString().replace(/\/+$/u, '');
-        } catch {
-            throw new PluginError(400, 'INVALID_REVERSE_PROXY', 'The AI Studio reverse proxy must be an HTTP(S) base URL without credentials, query or fragment.');
-        }
-        proxyPassword = body.proxy_password ?? '';
-        if (typeof proxyPassword !== 'string' || proxyPassword.length > 8192 || /[^\t\x20-\x7e\x80-\xff]/u.test(proxyPassword)) {
-            throw new PluginError(400, 'INVALID_PROXY_PASSWORD', 'The AI Studio proxy password is invalid.');
-        }
-    } else if (Object.hasOwn(body, 'proxy_password')) {
-        throw new PluginError(400, 'INVALID_REVERSE_PROXY', 'A proxy password requires an AI Studio reverse proxy URL.');
-    }
-
-    const model = requireCanonicalString(body.model, 'model', /^gemini-[a-z0-9][a-z0-9._-]*$/u);
     const region = source === 'vertexai'
         ? requireCanonicalString(body.vertexai_region, 'Vertex AI region', /^(?:global|[a-z0-9][a-z0-9-]*)$/u, 63) : undefined;
     const authMode = source === 'vertexai'
@@ -137,7 +125,7 @@ function validatePreparePayload(body) {
     return Object.freeze({
         protocolVersion: PROTOCOL_VERSION,
         source,
-        ...(reverseProxy ? { reverseProxy, proxyPassword } : {}),
+        ...(upstreamProxy || {}),
         model,
         region,
         authMode,

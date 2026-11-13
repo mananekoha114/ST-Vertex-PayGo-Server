@@ -1,19 +1,22 @@
 'use strict';
 
 const { StringDecoder } = require('node:string_decoder');
+const { readBoundedStream } = require('./bounded-buffer.cjs');
 const { PluginError, asPluginError, errorPayload } = require('./errors.cjs');
 const { sanitizeUsage } = require('./usage-capture.cjs');
 const { validatePreparedGoogleTarget } = require('./target-policy.cjs');
 const { isGemini4Model } = require('./gemini4-models.cjs');
+const { buildUpstreamRequest, redactProxySecret, toVertexBetaTarget } = require('./upstream-proxy.cjs');
 
 const protocolError = (code, message) => new PluginError(502, code, message);
 const MAX_ERROR_BYTES = 64 * 1024;
-const redact = text => text.replace(/AIza[0-9A-Za-z_-]{35}/gu, '[redacted]').replace(/ya29\.[0-9A-Za-z._-]+/gu, '[redacted]');
+const redact = (text, ticketData) => redactProxySecret(text, ticketData)
+    .replace(/AIza[0-9A-Za-z_-]{35}/gu, '[redacted]').replace(/ya29\.[0-9A-Za-z._-]+/gu, '[redacted]');
 // Google's error message is the only actionable diagnosis (free tier, region,
 // invalid argument); keep it bounded and without credentials.
-function googleFailure(status, error, prefix = `The Google upstream returned HTTP ${status}`) {
+function googleFailure(status, error, ticketData, prefix = `The Google upstream returned HTTP ${status}`) {
     const upstreamMessage = typeof error?.message === 'string'
-        ? redact(error.message).replace(/\s+/gu, ' ').trim().slice(0, 500) : '';
+        ? redact(error.message, ticketData).replace(/\s+/gu, ' ').trim().slice(0, 500) : '';
     const googleStatus = typeof error?.status === 'string' && /^[A-Z_]{1,64}$/u.test(error.status) ? error.status : undefined;
     return new PluginError(status >= 400 && status <= 599 ? status : 502, 'GEMINI4_UPSTREAM_HTTP_ERROR',
         `${prefix}${googleStatus ? ` ${googleStatus}` : ''}${upstreamMessage ? `: ${upstreamMessage}` : '.'}`,
@@ -72,15 +75,10 @@ async function runGemini4Transport({ request, response, ticketData, target, upst
     request.once('aborted', abort);
     response.once('close', close);
     try {
-        const chunks = [];
-        let size = 0;
-        for await (const chunk of request) {
-            size += chunk.length;
-            if (size > maxBodyBytes) throw new PluginError(413, 'REQUEST_BODY_TOO_LARGE', 'The proxied Google request body is too large.');
-            chunks.push(chunk);
-        }
+        const requestBody = await readBoundedStream(request, maxBodyBytes);
+        if (!requestBody) throw new PluginError(413, 'REQUEST_BODY_TOO_LARGE', 'The proxied Google request body is too large.');
         let original;
-        try { original = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { throw new PluginError(400, 'INVALID_GOOGLE_BODY', 'The Google request must be a JSON object.'); }
+        try { original = JSON.parse(requestBody.toString('utf8')); } catch { throw new PluginError(400, 'INVALID_GOOGLE_BODY', 'The Google request must be a JSON object.'); }
         if (!original || typeof original !== 'object' || Array.isArray(original)) throw new PluginError(400, 'INVALID_GOOGLE_BODY', 'The Google request must be a JSON object.');
         const config = { ...(original.generationConfig || {}) };
         for (const key of ['temperature', 'topP', 'topK', 'candidateCount', 'presencePenalty', 'frequencyPenalty']) delete config[key];
@@ -94,18 +92,18 @@ async function runGemini4Transport({ request, response, ticketData, target, upst
         const parts = [];
         let finalValue;
         let retainedBytes = 0;
-        const upstreamTarget = new URL(target);
-        if (ticketData.source !== 'makersuite') upstreamTarget.pathname = upstreamTarget.pathname.replace(/^\/v1\//u, '/v1beta1/');
+        const upstreamTarget = toVertexBetaTarget(target, ticketData);
         validatePreparedGoogleTarget(upstreamTarget.toString(), ticketData);
+        const upstream = buildUpstreamRequest(upstreamTarget, ticketData, request.headers);
         for (let hop = 0; hop < maxHops; hop++) {
             if (gone) throw protocolError('CLIENT_DISCONNECTED', 'The client disconnected.');
             const body = { ...original, generationConfig: { ...config } };
             if (token) body.continuationToken = token;
             const bytes = Buffer.from(JSON.stringify(body));
             const upstreamResponse = await new Promise((resolve, reject) => {
-                const headers = Object.fromEntries(Object.entries(ticketData.headers).filter(([name]) => !['content-length', 'accept-encoding'].includes(name.toLowerCase())));
+                const headers = Object.fromEntries(Object.entries(upstream.headers).filter(([name]) => !['content-length', 'accept-encoding'].includes(name.toLowerCase())));
                 headers['Content-Length'] = bytes.length;
-                active = upstreamRequest(upstreamTarget, { method: 'POST', headers }, resolve);
+                active = upstreamRequest(upstream.url, { method: 'POST', headers }, resolve);
                 active.once('error', reject);
                 active.setTimeout?.(upstreamTimeoutMs, () => active.destroy(new PluginError(504, 'VERTEX_UPSTREAM_TIMEOUT', 'The Google upstream request timed out.')));
                 active.end(bytes);
@@ -114,7 +112,7 @@ async function runGemini4Transport({ request, response, ticketData, target, upst
             if (gone) { upstreamResponse.destroy(); throw protocolError('CLIENT_DISCONNECTED', 'The client disconnected.'); }
             const status = upstreamResponse.statusCode || 502;
             if (status >= 300 && status < 400) { upstreamResponse.destroy(); throw protocolError('GEMINI4_UPSTREAM_HTTP_ERROR', `The Google upstream returned HTTP ${status}.`); }
-            if (status >= 400) throw googleFailure(status, await readGoogleError(upstreamResponse));
+            if (status >= 400) throw googleFailure(status, await readGoogleError(upstreamResponse), ticketData);
             const encoding = upstreamResponse.headers?.['content-encoding'];
             if (encoding && encoding !== 'identity') { upstreamResponse.destroy(); throw protocolError('GEMINI4_COMPRESSED_RESPONSE', 'The Google upstream returned unsupported compressed data.'); }
             let latestUsage;
@@ -123,7 +121,7 @@ async function runGemini4Transport({ request, response, ticketData, target, upst
             let lastCandidate;
             const accept = async value => {
                 if (!value || typeof value !== 'object') throw protocolError('GEMINI4_UPSTREAM_ERROR', 'The Google upstream returned an error.');
-                if (value.error) throw googleFailure(Number.isSafeInteger(value.error.code) ? value.error.code : 502, value.error, 'The Google upstream returned an error');
+                if (value.error) throw googleFailure(Number.isSafeInteger(value.error.code) ? value.error.code : 502, value.error, ticketData, 'The Google upstream returned an error');
                 if (value.usageMetadata) { latestUsage = value.usageMetadata; onUsage(addUsage(usage, latestUsage), false); }
                 if (typeof value.continuationToken === 'string') latestToken = value.continuationToken;
                 const candidate = value.candidates?.[0];

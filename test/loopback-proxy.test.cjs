@@ -11,6 +11,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
+const http = require('node:http');
 const os = require('node:os');
 const path = require('node:path');
 const { PassThrough } = require('node:stream');
@@ -213,6 +214,37 @@ test('loopback proxy enforces its independent request-body limit', async () => {
             body: '{"large":true}',
         });
         assert.equal(response.status, 413);
+        assert.equal(calls.length, 0);
+    } finally {
+        store.close();
+        await transport.close();
+    }
+});
+
+test('loopback proxy answers an oversized chunked upload with 413 instead of a reset', async () => {
+    const calls = [];
+    const store = new TicketStore();
+    const transport = createLoopbackTransport({
+        ticketStore: store,
+        upstreamRequest: createFakeUpstream(calls),
+        maxBodyBytes: 4,
+    });
+    await transport.start();
+    try {
+        const issued = store.create(ticketPayload());
+        const status = await new Promise((resolve, reject) => {
+            const request = http.request(`${transport.baseUrl}/proxy/${issued.ticket}/v1/publishers/google/models/gemini-2.5-pro:streamGenerateContent?alt=sse`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'Transfer-Encoding': 'chunked', Authorization: `Bearer ${issued.proxySecret}` },
+            }, response => {
+                response.resume();
+                response.once('end', () => resolve(response.statusCode));
+            });
+            request.once('error', reject);
+            request.write('{"large"');
+            request.end(':true}');
+        });
+        assert.equal(status, 413);
         assert.equal(calls.length, 0);
     } finally {
         store.close();

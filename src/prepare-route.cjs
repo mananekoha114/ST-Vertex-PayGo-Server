@@ -14,6 +14,7 @@ const { sendExpressError, PluginError } = require('./errors.cjs');
 const { describeError } = require('./log-store.cjs');
 const { PLUGIN_ID, PROTOCOL_VERSION, validatePreparePayload } = require('./protocol.cjs');
 const { prepareGoogleHeaders, prepareGoogleTarget } = require('./target-policy.cjs');
+const { takeProxyKey } = require('./upstream-proxy.cjs');
 const { GEMINI4_MODELS } = require('./gemini4-models.cjs');
 const EXPLICIT_SECRET_ERROR_CODES = new Set([
     'EXPLICIT_SECRET_UNSUPPORTED',
@@ -82,7 +83,7 @@ function createPrepareHandler({ stRuntime, ticketStore, loopbackTransport, logSt
                 syntheticBody.proxy_password = config.proxyPassword;
             }
 
-            // Only the validated Studio proxy settings reach the host helper.
+            // Only the validated reverse-proxy settings reach the host helper.
             const syntheticRequest = {
                 body: syntheticBody,
                 user: { directories: request.user.directories },
@@ -105,9 +106,13 @@ function createPrepareHandler({ stRuntime, ticketStore, loopbackTransport, logSt
             }
 
             const targetUrl = prepareGoogleTarget(googleConfig.url, config);
-            const headers = prepareGoogleHeaders(googleConfig.headers, buildPayGoHeaders(config), {
+            const preparedHeaders = prepareGoogleHeaders(googleConfig.headers, buildPayGoHeaders(config), {
                 allowUnauthenticated: Boolean(config.reverseProxy),
             });
+            // The host returns a Studio proxy credential as a header; the proxy
+            // receives it as ?key= like SillyTavern's own chat request.
+            const { headers, proxyKey } = config.reverseProxy && config.source === 'makersuite'
+                ? takeProxyKey(preparedHeaders) : { headers: preparedHeaders };
             if (request.aborted || response.destroyed) {
                 logStore?.server('warn', 'prepare_client_disconnected', prepareLogContext(config, startedAt));
                 ticketStore.release(reservation);
@@ -134,6 +139,7 @@ function createPrepareHandler({ stRuntime, ticketStore, loopbackTransport, logSt
                 headers,
                 source: config.source,
                 ...(config.reverseProxy ? { reverseProxy: config.reverseProxy } : {}),
+                ...(proxyKey !== undefined ? { proxyKey } : {}),
                 model: config.model,
                 stream: config.stream,
                 endpoint,
@@ -153,9 +159,11 @@ function createPrepareHandler({ stRuntime, ticketStore, loopbackTransport, logSt
                 transport: 'loopback-http',
                 nativeGemini4: true,
                 nativeGemini4Models: [...GEMINI4_MODELS],
+                // A prepared Vertex target is always v1, with or without a proxy
+                // base; the native route rewrites Gemini 4 to v1beta1 itself.
                 nativeGeminiApiVersion: config.source === 'makersuite'
                     ? new URL(targetUrl).pathname.match(/\/(v1(?:beta|alpha)?)\/models\/[^/]+$/u)[1]
-                    : new URL(targetUrl).pathname.split('/')[1],
+                    : 'v1',
                 ticket: issued.ticket,
                 proxySecret: issued.proxySecret,
                 proxyUrl,
