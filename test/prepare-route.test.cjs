@@ -89,7 +89,7 @@ test('prepare synthesizes ST auth request and issues an opaque loopback ticket',
         assert.equal(response.body.ok, true);
         assert.match(response.body.proxyUrl, /^http:\/\/127\.0\.0\.1:54321\/proxy\//u);
         // Frontends check this list before retargeting a Gemini 4 request.
-        assert.deepEqual(response.body.nativeGemini4Models, ['gemini-4-carbon', 'gemini-4-argon', 'gemini-4-argon-cyber-permissive']);
+        assert.deepEqual(response.body.nativeGemini4Models, ['gemini-4-hydrogen', 'gemini-4-carbon', 'gemini-4-argon', 'gemini-4-argon-cyber-permissive']);
         assert.equal(calls.length, 1);
         assert.deepEqual(calls[0].request.body, {
             api: 'vertexai',

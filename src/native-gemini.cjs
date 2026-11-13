@@ -6,7 +6,7 @@ const { Readable } = require('node:stream');
 const { inspect } = require('node:util');
 const { PluginError, asPluginError, errorPayload } = require('./errors.cjs');
 const { writeResponse } = require('./gemini4-transport.cjs');
-const { isGemini4Model } = require('./gemini4-models.cjs');
+const { isGemini4Model, maxThinkingLevel, dropsMismatchedSignatures } = require('./gemini4-models.cjs');
 const { sanitizeUsage } = require('./usage-capture.cjs');
 
 // Match the host's console body logs without exposing private transport metadata.
@@ -147,8 +147,10 @@ async function buildNativeGeminiBody(input, runtime) {
     });
     if (input.continue_prefill || prompt.contents.at(-1)?.role === 'model') prompt.contents.push({ role: 'user', parts: [{ text: 'Continue the previous assistant response from where it stopped, without repeating previous content.' }] });
     const thinkingConfig = { includeThoughts: Boolean(input.include_reasoning) };
-    const level = { min: 'LOW', minimal: 'LOW', low: 'LOW', medium: 'MEDIUM', high: 'HIGH', max: 'HIGH' }[String(input.reasoning_effort).toLowerCase()];
+    const level = { min: 'LOW', minimal: 'LOW', low: 'LOW', medium: 'MEDIUM', high: 'HIGH', max: maxThinkingLevel(input.model) }[String(input.reasoning_effort).toLowerCase()];
     if (level) thinkingConfig.thinkingLevel = level;
+    // Lorebook entries, macros and message edits change earlier context between turns.
+    if (dropsMismatchedSignatures(input.model, input.chat_completion_source)) thinkingConfig.prefixMismatchBehavior = 'DROP';
     const generationConfig = { maxOutputTokens: input.max_tokens, thinkingConfig };
     if (Array.isArray(input.stop) && input.stop.length) generationConfig.stopSequences = input.stop;
     if (input.seed !== undefined) generationConfig.seed = input.seed;

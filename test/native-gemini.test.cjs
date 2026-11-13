@@ -152,11 +152,27 @@ test('nonstream thought-only MAX_TOKENS fails with the output budget code', asyn
     assert.equal(res.statusCode,502);assert.equal(res.data.error.code,'GEMINI4_OUTPUT_BUDGET_EXHAUSTED');assert.equal(res.data.error.message,res.data.message);
 });
 test('native body accepts every supported Gemini 4 model and rejects others', async () => {
-    for (const model of ['gemini-4-carbon', 'gemini-4-argon', 'gemini-4-argon-cyber-permissive']) {
+    for (const model of ['gemini-4-hydrogen', 'gemini-4-carbon', 'gemini-4-argon', 'gemini-4-argon-cyber-permissive']) {
         const body = await buildNativeGeminiBody({...fixture, model, chat_completion_source:'vertexai', reasoning_effort:'max'}, runtime);
-        assert.equal(body.generationConfig.thinkingConfig.thinkingLevel, 'HIGH');
+        assert.equal(body.generationConfig.thinkingConfig.thinkingLevel, model === 'gemini-4-hydrogen' ? 'XHIGH' : 'HIGH');
     }
     for (const model of ['gemini-3.1-pro-preview', 'gemini-4-carbon-preview']) {
         await assert.rejects(buildNativeGeminiBody({...fixture, model}, runtime), error => error.code === 'NATIVE_GEMINI_MODEL_UNSUPPORTED');
+    }
+});
+test('Hydrogen maps the top effort to XHIGH and keeps the model default on auto', async () => {
+    const level = async (model, reasoning_effort) => (await buildNativeGeminiBody({...fixture, model, reasoning_effort}, runtime)).generationConfig.thinkingConfig.thinkingLevel;
+    for (const [effort, expected] of [['min', 'LOW'], ['low', 'LOW'], ['medium', 'MEDIUM'], ['high', 'HIGH'], ['max', 'XHIGH'], ['auto', undefined]]) {
+        assert.equal(await level('gemini-4-hydrogen', effort), expected);
+    }
+    assert.equal(await level('gemini-4-carbon', 'max'), 'HIGH');
+});
+test('only Vertex Hydrogen asks Google to drop signatures bound to edited context', async () => {
+    const config = async (model, chat_completion_source) => (await buildNativeGeminiBody({...fixture, model, chat_completion_source, reasoning_effort:'high', include_reasoning:true}, runtime)).generationConfig.thinkingConfig;
+    assert.deepEqual(await config('gemini-4-hydrogen', 'vertexai'), {includeThoughts:true, thinkingLevel:'HIGH', prefixMismatchBehavior:'DROP'});
+    // AI Studio's ThinkingConfig has no prefix mismatch field.
+    assert.deepEqual(await config('gemini-4-hydrogen', 'makersuite'), {includeThoughts:true, thinkingLevel:'HIGH'});
+    for (const model of ['gemini-4-carbon', 'gemini-4-argon', 'gemini-4-argon-cyber-permissive']) {
+        assert.equal((await config(model, 'vertexai')).prefixMismatchBehavior, undefined);
     }
 });

@@ -35,7 +35,7 @@ function nativeHost() {
     }) } };
 }
 
-for (const model of ['gemini-4-argon', 'gemini-4-carbon']) for (const source of ['makersuite', 'vertexai']) for (const stream of [false, true]) {
+for (const model of ['gemini-4-argon', 'gemini-4-carbon', 'gemini-4-hydrogen']) for (const source of ['makersuite', 'vertexai']) for (const stream of [false, true]) {
     test(`native Gemini 4 full flow: frontend -> authenticated route -> ticket -> two mock hops -> ST parser (${model}, ${source}, stream=${stream})`, { skip: !available }, async () => {
         const { installRequestTransport } = await import(pathToFileURL(frontEntry));
         const { sandbox, runtime } = nativeHost();
@@ -122,7 +122,10 @@ for (const model of ['gemini-4-argon', 'gemini-4-carbon']) for (const source of 
             assert.equal(upstreamCalls.length, 2);
             assert.equal(upstreamCalls[1].body.continuationToken, 'next-hop');
             assert.equal(upstreamCalls[1].body.generationConfig.maxOutputTokens, 64);
-            assert.deepEqual(upstreamCalls[0].body.generationConfig.thinkingConfig, { includeThoughts: true, thinkingLevel: 'MEDIUM' });
+            // Vertex Hydrogen rejects replays with edited earlier context unless mismatched signatures are dropped.
+            const thinkingConfig = { includeThoughts: true, thinkingLevel: 'MEDIUM',
+                ...(model === 'gemini-4-hydrogen' && source === 'vertexai' ? { prefixMismatchBehavior: 'DROP' } : {}) };
+            for (const call of upstreamCalls) assert.deepEqual(call.body.generationConfig.thinkingConfig, thinkingConfig);
             assert.equal(upstreamCalls[0].body.generationConfig.candidateCount, undefined);
             if (source === 'vertexai') assert.match(upstreamCalls[0].target, /\/v1beta1\//u);
             else assert.equal(upstreamCalls[0].body.service_tier, 'flex');
