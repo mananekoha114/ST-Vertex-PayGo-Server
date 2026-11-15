@@ -65,7 +65,7 @@ async function write(response, data) {
     });
 }
 async function runGemini4Transport({ request, response, ticketData, target, upstreamRequest,
-    maxBodyBytes, upstreamTimeoutMs, onUsage = () => {}, maxHops = 32 }) {
+    maxBodyBytes, upstreamTimeoutMs, onUsage = () => {}, onUpstreamUnauthorized = undefined, maxHops = 32 }) {
     let active;
     let activeIncoming;
     let gone = false;
@@ -111,6 +111,7 @@ async function runGemini4Transport({ request, response, ticketData, target, upst
             activeIncoming = upstreamResponse;
             if (gone) { upstreamResponse.destroy(); throw protocolError('CLIENT_DISCONNECTED', 'The client disconnected.'); }
             const status = upstreamResponse.statusCode || 502;
+            if (status === 401 && ticketData.oauthCacheKey) onUpstreamUnauthorized?.(ticketData.oauthCacheKey);
             if (status >= 300 && status < 400) { upstreamResponse.destroy(); throw protocolError('GEMINI4_UPSTREAM_HTTP_ERROR', `The Google upstream returned HTTP ${status}.`); }
             if (status >= 400) throw googleFailure(status, await readGoogleError(upstreamResponse), ticketData);
             const encoding = upstreamResponse.headers?.['content-encoding'];

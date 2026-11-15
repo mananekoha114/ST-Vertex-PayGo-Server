@@ -10,6 +10,9 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const { PassThrough } = require('node:stream');
+const { PluginError } = require('../src/errors.cjs');
+const { createLoopbackTransport } = require('../src/loopback-server.cjs');
 const { createPrepareHandler, resolveUserKey } = require('../src/prepare-route.cjs');
 const { TicketStore } = require('../src/ticket-store.cjs');
 
@@ -40,7 +43,7 @@ function makeBody(overrides = {}) {
 
 function captureLog(records) {
     return {
-        server(level, event, context) { records.push({ level, event, context }); },
+        server(level, event, context, options) { records.push({ level, event, context, options }); },
     };
 }
 
@@ -266,4 +269,106 @@ test('usage ledger creation failure does not block proxy preparation', async () 
         assert.equal(response.statusCode, 200);
         assert.equal(response.body.usageId, null);
     } finally { ticketStore.close(); }
+});
+
+test('prepare preserves granular OAuth PluginErrors (5xx, 429, 400) and logs 5xx at normal priority', async () => {
+    const cases = [
+        new PluginError(500, 'VERTEX_OAUTH_UPSTREAM_ERROR', 'Google OAuth or the network proxy returned HTTP 500.', {
+            details: { upstreamStatus: 500 },
+        }),
+        new PluginError(504, 'VERTEX_OAUTH_TIMEOUT', 'Timed out while requesting a Google OAuth access token.', {
+            details: { networkCode: 'ETIMEDOUT' },
+        }),
+        new PluginError(429, 'VERTEX_OAUTH_RATE_LIMITED', 'Google OAuth rate-limited the access token request.', {
+            details: { upstreamStatus: 429 },
+        }),
+        new PluginError(400, 'VERTEX_OAUTH_REJECTED', 'Google OAuth rejected the service account credentials (invalid_grant).', {
+            details: { upstreamStatus: 401, oauthError: 'invalid_grant' },
+        }),
+    ];
+
+    for (const expected of cases) {
+        const ticketStore = new TicketStore();
+        const logs = [];
+        try {
+            const handler = createPrepareHandler({
+                stRuntime: { async getGoogleApiConfig() { throw expected; } },
+                ticketStore,
+                loopbackTransport: { baseUrl: 'http://127.0.0.1:1' },
+                logStore: captureLog(logs),
+            });
+            const response = makeResponse();
+            await handler({ body: makeBody(), user: { directories: { root: 'test-user' } } }, response);
+            assert.equal(response.statusCode, expected.status);
+            assert.equal(response.body.code, expected.code);
+            assert.deepEqual(response.body.details, expected.details);
+            const failureLog = logs.at(-1);
+            assert.equal(failureLog.event, 'prepare_failed');
+            assert.equal(failureLog.options?.priority, expected.status >= 500 ? 'normal' : 'low');
+            assert.equal(failureLog.context.errorCode, expected.code);
+            assert.equal(failureLog.context.statusCode, expected.status);
+        } finally {
+            ticketStore.close();
+        }
+    }
+});
+
+test('downstream Vertex HTTP 401 evicts the ticket OAuth cache key without exposing oauthCacheKey to the client', async () => {
+    const ticketStore = new TicketStore();
+    const invalidatedKeys = [];
+    const upstreamRequest = (_target, _options, onResponse) => {
+        const outgoing = new PassThrough();
+        outgoing.setTimeout = () => outgoing;
+        outgoing.once('finish', () => {
+            const incoming = new PassThrough();
+            incoming.statusCode = 401;
+            incoming.headers = { 'content-type': 'application/json' };
+            onResponse(incoming);
+            incoming.end(JSON.stringify({ error: { code: 401, message: 'Token revoked' } }));
+        });
+        return outgoing;
+    };
+    const loopbackTransport = createLoopbackTransport({
+        ticketStore,
+        upstreamRequest,
+        onUpstreamUnauthorized: key => invalidatedKeys.push(key),
+    });
+    await loopbackTransport.start();
+
+    try {
+        const handler = createPrepareHandler({
+            stRuntime: {
+                async getGoogleApiConfig(_request, model, endpoint) {
+                    return {
+                        url: `https://aiplatform.googleapis.com/v1/projects/demo/locations/global/publishers/google/models/${model}:${endpoint}`,
+                        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer cached-access-token' },
+                        oauthCacheKey: 'cache-key-sha256-demo',
+                    };
+                },
+            },
+            ticketStore,
+            loopbackTransport,
+        });
+        const prepared = makeResponse();
+        await handler({ body: makeBody({ stream: false }), user: { directories: { root: 'test-user' } } }, prepared);
+        assert.equal(prepared.statusCode, 200);
+        assert.equal(Object.hasOwn(prepared.body, 'oauthCacheKey'), false);
+
+        const proxyResponse = await fetch(
+            `${prepared.body.proxyUrl}/v1/publishers/google/models/gemini-2.5-pro:generateContent`,
+            {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    Authorization: `Bearer ${prepared.body.proxySecret}`,
+                },
+                body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text: 'ping' }] }] }),
+            },
+        );
+        assert.equal(proxyResponse.status, 401);
+        assert.deepEqual(invalidatedKeys, ['cache-key-sha256-demo']);
+    } finally {
+        await loopbackTransport.close();
+        ticketStore.close();
+    }
 });

@@ -121,6 +121,7 @@ function createProxyHandler({
     upstreamRequest = (target, options, callback) => (target.protocol === 'http:' ? http : https).request(target, options, callback),
     maxBodyBytes = 500 * 1024 * 1024,
     upstreamTimeoutMs = 31 * 60_000,
+    onUpstreamUnauthorized = undefined,
 } = {}) {
     return function proxyHandler(request, response) {
         const startedAt = Date.now();
@@ -214,7 +215,7 @@ function createProxyHandler({
                 usageCapture = { finish: () => aggregateUsage };
                 runGemini4Transport({
                     request, response, ticketData, target, upstreamRequest,
-                    maxBodyBytes, upstreamTimeoutMs,
+                    maxBodyBytes, upstreamTimeoutMs, onUpstreamUnauthorized,
                     onUsage: (usage, complete) => {
                         aggregateUsage = usage;
                         if (complete) {
@@ -262,6 +263,9 @@ function createProxyHandler({
                         return;
                     }
                     const statusCode = upstreamResponse.statusCode || 502;
+                    if (statusCode === 401 && ticketData.oauthCacheKey) {
+                        onUpstreamUnauthorized?.(ticketData.oauthCacheKey);
+                    }
                     if (statusCode >= 300 && statusCode < 400) {
                         // Relaying Location would let SillyTavern's outer node-fetch follow
                         // the redirect after it leaves this allowlisted transport.

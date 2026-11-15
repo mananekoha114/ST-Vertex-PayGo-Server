@@ -121,6 +121,8 @@ function validateClientLogEvent(body) {
     return Object.freeze(event);
 }
 
+const SAFE_NETWORK_CODE_PATTERN = /^[A-Z][A-Z0-9_]{1,31}$/u;
+
 function describeError(error) {
     const details = {};
     if (typeof error?.name === 'string' && ERROR_CODE_PATTERN.test(error.name)) {
@@ -131,6 +133,21 @@ function describeError(error) {
     }
     if (Number.isSafeInteger(error?.status) && error.status >= 100 && error.status <= 599) {
         details.statusCode = error.status;
+    }
+    const extra = error?.details;
+    if (extra && typeof extra === 'object' && !Array.isArray(extra)) {
+        if (Number.isSafeInteger(extra.upstreamStatus) && extra.upstreamStatus >= 100 && extra.upstreamStatus <= 599) {
+            details.upstreamStatus = extra.upstreamStatus;
+        }
+        if (typeof extra.oauthError === 'string' && extra.oauthError.length <= 64 && ERROR_CODE_PATTERN.test(extra.oauthError)) {
+            details.oauthError = extra.oauthError;
+        }
+        if (typeof extra.networkCode === 'string' && SAFE_NETWORK_CODE_PATTERN.test(extra.networkCode)) {
+            details.networkCode = extra.networkCode;
+        }
+        if (extra.authMode === 'express' || extra.authMode === 'full') {
+            details.authMode = extra.authMode;
+        }
     }
     return details;
 }

@@ -13,8 +13,8 @@ const { PluginError } = require('./errors.cjs');
 const { describeError } = require('./log-store.cjs');
 const { createProxyHandler } = require('./proxy-handler.cjs');
 
-function createLoopbackTransport({ ticketStore, logStore, usageStore, upstreamRequest, maxBodyBytes, upstreamTimeoutMs, openaiBridge } = {}) {
-    const proxyHandler = createProxyHandler({ ticketStore, logStore, usageStore, upstreamRequest, maxBodyBytes, upstreamTimeoutMs });
+function createLoopbackTransport({ ticketStore, logStore, usageStore, upstreamRequest, maxBodyBytes, upstreamTimeoutMs, onUpstreamUnauthorized, openaiBridge } = {}) {
+    const proxyHandler = createProxyHandler({ ticketStore, logStore, usageStore, upstreamRequest, maxBodyBytes, upstreamTimeoutMs, onUpstreamUnauthorized });
     let server;
     let baseUrl;
 

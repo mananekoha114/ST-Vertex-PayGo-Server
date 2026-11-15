@@ -148,17 +148,30 @@ test('client log validation accepts only bounded structured metadata', () => {
     }), { code: 'INVALID_CLIENT_LOG_EVENT' });
 });
 
-test('error descriptions omit messages, stacks, and causes', () => {
+test('error descriptions omit messages, stacks, and causes while retaining allowlisted diagnostic details', () => {
     const cause = new Error('private key contents');
     const error = new Error('Bearer private-token', { cause });
-    error.code = 'VERTEX_UPSTREAM_FAILED';
-    error.status = 502;
+    error.code = 'VERTEX_OAUTH_REJECTED';
+    error.status = 400;
+    error.details = {
+        upstreamStatus: 401,
+        oauthError: 'invalid_grant',
+        networkCode: 'ECONNRESET',
+        authMode: 'full',
+        oauthDescription: 'free-form text excluded from structured log store',
+        privateKey: 'secret-private-key',
+        accessToken: 'ya29.secret',
+    };
     assert.deepEqual(describeError(error), {
         errorName: 'Error',
-        errorCode: 'VERTEX_UPSTREAM_FAILED',
-        statusCode: 502,
+        errorCode: 'VERTEX_OAUTH_REJECTED',
+        statusCode: 400,
+        upstreamStatus: 401,
+        oauthError: 'invalid_grant',
+        networkCode: 'ECONNRESET',
+        authMode: 'full',
     });
-    assert.doesNotMatch(JSON.stringify(describeError(error)), /private/u);
+    assert.doesNotMatch(JSON.stringify(describeError(error)), /private|secret|free-form|ya29/u);
 });
 
 test('log store stops cleanly at its hard file size limit', () => {

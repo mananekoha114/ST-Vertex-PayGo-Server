@@ -350,3 +350,93 @@ test('data backup routes and capability are installed together', () => {
     routes.get[0][1]({ user: {} }, response);
     assert.equal(response.body.capabilities.dataBackups, true);
 });
+
+test('missing active secrets fail with specific 400 codes and explicit secret_id infers Express vs Full without cross-mode bleed on implicit requests', async () => {
+    const serviceAccount = {
+        project_id: 'profile-project',
+        client_email: 'profile@profile-project.iam.gserviceaccount.com',
+        private_key: 'test-private-key',
+    };
+    let tokenCalls = 0;
+    const secrets = {
+        'vertex-sa:sa-uuid': JSON.stringify(serviceAccount),
+        'vertex-key:express-uuid': 'express-api-key-value',
+    };
+    const runtime = await loadStRuntime({
+        rootDir: 'C:\\fake-host',
+        readFile: async () => JSON.stringify({ name: 'sillytavern', version: '1.18.0' }),
+        importModule: async specifier => specifier.endsWith('/secrets.js') ? {
+            SECRET_KEYS: { MAKERSUITE: 'makersuite', VERTEXAI: 'vertex-key', VERTEXAI_SERVICE_ACCOUNT: 'vertex-sa' },
+            readSecret: (_directories, key, id) => secrets[id ? `${key}:${id}` : `${key}:active`] || '',
+        } : {
+            getGoogleApiConfig: async () => ({
+                url: 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent',
+                headers: { 'Content-Type': 'application/json' },
+            }),
+            getProjectIdFromServiceAccount: account => account.project_id,
+            generateJWTToken: async account => `jwt-${account.client_email}`,
+            getAccessToken: async jwt => `token-${++tokenCalls}-${jwt}`,
+        },
+    });
+    const user = { directories: { root: 'C:\\users\\alice' } };
+
+    // Missing implicit secrets return explicit 400 codes instead of falling through to 500 UNSAFE_GOOGLE_HEADERS.
+    await assert.rejects(
+        runtime.getGoogleApiConfig({ body: { api: 'makersuite' }, user }, 'gemini-2.5-flash', 'generateContent'),
+        { status: 400, code: 'GOOGLE_SECRET_MISSING' },
+    );
+    await assert.rejects(
+        runtime.getGoogleApiConfig({ body: { api: 'vertexai', vertexai_auth_mode: 'express' }, user }, 'gemini-2.5-flash', 'generateContent'),
+        { status: 400, code: 'VERTEX_SECRET_MISSING', details: { authMode: 'express' } },
+    );
+    await assert.rejects(
+        runtime.getGoogleApiConfig({ body: { api: 'vertexai', vertexai_auth_mode: 'full' }, user }, 'gemini-2.5-flash', 'generateContent'),
+        { status: 400, code: 'VERTEX_SECRET_MISSING', details: { authMode: 'full' } },
+    );
+
+    // Implicit mode never crosses buckets even when the other bucket has an active credential.
+    secrets['vertex-sa:active'] = JSON.stringify(serviceAccount);
+    await assert.rejects(
+        runtime.getGoogleApiConfig({ body: { api: 'vertexai', vertexai_auth_mode: 'express' }, user }, 'gemini-2.5-flash', 'generateContent'),
+        { status: 400, code: 'VERTEX_SECRET_MISSING', details: { authMode: 'express' } },
+    );
+
+    // Explicit secret_id belonging to VERTEXAI_SERVICE_ACCOUNT succeeds even when background caller defaulted authMode to 'express'.
+    const inferredFull = await runtime.getGoogleApiConfig({
+        body: { api: 'vertexai', secret_id: 'sa-uuid', vertexai_auth_mode: 'express', vertexai_region: 'global' },
+        user,
+    }, 'gemini-2.5-pro', 'generateContent');
+    assert.equal(inferredFull.headers.Authorization, 'Bearer token-1-jwt-profile@profile-project.iam.gserviceaccount.com');
+    assert.match(inferredFull.url, /projects\/profile-project\/locations\/global/u);
+    assert.equal(typeof inferredFull.oauthCacheKey, 'string');
+
+    // Second call reuses the cached token; invalidation forces a fresh token exchange.
+    const cachedFull = await runtime.getGoogleApiConfig({
+        body: { api: 'vertexai', secret_id: 'sa-uuid', vertexai_auth_mode: 'full', vertexai_region: 'global' },
+        user,
+    }, 'gemini-2.5-pro', 'generateContent');
+    assert.equal(cachedFull.headers.Authorization, inferredFull.headers.Authorization);
+    assert.equal(tokenCalls, 1);
+
+    runtime.invalidateOAuthToken(inferredFull.oauthCacheKey);
+    const refreshedFull = await runtime.getGoogleApiConfig({
+        body: { api: 'vertexai', secret_id: 'sa-uuid', vertexai_auth_mode: 'full', vertexai_region: 'global' },
+        user,
+    }, 'gemini-2.5-pro', 'generateContent');
+    assert.equal(refreshedFull.headers.Authorization, 'Bearer token-2-jwt-profile@profile-project.iam.gserviceaccount.com');
+    assert.equal(tokenCalls, 2);
+
+    // Explicit secret_id belonging to VERTEXAI Express succeeds even when authMode was 'full'.
+    const inferredExpress = await runtime.getGoogleApiConfig({
+        body: { api: 'vertexai', secret_id: 'express-uuid', vertexai_auth_mode: 'full', vertexai_region: 'us-central1' },
+        user,
+    }, 'gemini-2.5-flash', 'generateContent');
+    assert.equal(inferredExpress.headers['x-goog-api-key'], 'express-api-key-value');
+
+    runtime.clearOAuthCache();
+    const afterClear = await runtime.getGoogleApiConfig({
+        body: { api: 'vertexai', secret_id: 'sa-uuid', vertexai_auth_mode: 'full', vertexai_region: 'global' },
+        user,
+    }, 'gemini-2.5-pro', 'generateContent');
+    assert.equal(afterClear.headers.Authorization, 'Bearer token-3-jwt-profile@profile-project.iam.gserviceaccount.com');
+});

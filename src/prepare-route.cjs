@@ -94,6 +94,9 @@ function createPrepareHandler({ stRuntime, ticketStore, loopbackTransport, logSt
             try {
                 googleConfig = await stRuntime.getGoogleApiConfig(syntheticRequest, config.model, endpoint);
             } catch (error) {
+                if (error instanceof PluginError) {
+                    throw error;
+                }
                 if (EXPLICIT_SECRET_ERROR_CODES.has(error?.code)) {
                     throw new PluginError(400, error.code, error.message, { cause: error });
                 }
@@ -140,6 +143,9 @@ function createPrepareHandler({ stRuntime, ticketStore, loopbackTransport, logSt
                 source: config.source,
                 ...(config.reverseProxy ? { reverseProxy: config.reverseProxy } : {}),
                 ...(proxyKey !== undefined ? { proxyKey } : {}),
+                ...(typeof googleConfig.oauthCacheKey === 'string' && googleConfig.oauthCacheKey
+                    ? { oauthCacheKey: googleConfig.oauthCacheKey }
+                    : {}),
                 model: config.model,
                 stream: config.stream,
                 endpoint,
@@ -173,10 +179,10 @@ function createPrepareHandler({ stRuntime, ticketStore, loopbackTransport, logSt
         } catch (error) {
             if (reservation) ticketStore.release(reservation);
             if (usageReference) usageStore?.update(usageReference, { status: 'failed', errorCode: error?.code || 'PREPARE_FAILED' });
-            // Every failed prepare is derived from browser-controlled setup or
-            // authentication. Keep it out of the shared diagnostic budget so a
-            // repeated rejection cannot hide successful proxy failures.
-            logStore?.server('error', 'prepare_failed', prepareLogContext(config, startedAt, describeError(error)), { priority: 'low' });
+            // Browser-controlled setup and 4xx rejections stay in the low-priority
+            // budget; authenticated upstream OAuth 5xx/network failures use normal.
+            const priority = error instanceof PluginError && error.status >= 500 ? 'normal' : 'low';
+            logStore?.server('error', 'prepare_failed', prepareLogContext(config, startedAt, describeError(error)), { priority });
             return sendExpressError(response, error);
         }
     };

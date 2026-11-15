@@ -12,8 +12,10 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { pathToFileURL } = require('node:url');
 const { PluginError } = require('./errors.cjs');
+const { createVertexOAuthClient } = require('./vertex-oauth.cjs');
 
 const MINIMUM_SILLYTAVERN_VERSION = Object.freeze([1, 16, 0]);
+const defaultImportModule = specifier => import(specifier);
 
 function parseVersionCore(version) {
     if (typeof version !== 'string') return null;
@@ -49,8 +51,11 @@ function isSupportedHost(packageData) {
 async function loadStRuntime({
     rootDir = process.cwd(),
     readFile = fs.promises.readFile,
-    importModule = specifier => import(specifier),
+    importModule = defaultImportModule,
     fileExists = filename => fs.existsSync(filename),
+    oauthRequest = undefined,
+    oauthTimeoutMs = undefined,
+    now = Date.now,
 } = {}) {
     const resolvedRoot = path.resolve(rootDir);
     let packageData;
@@ -108,6 +113,21 @@ async function loadStRuntime({
         throw new PluginError(500, 'INCOMPATIBLE_SILLYTAVERN', 'The host does not export the required secret manager.');
     }
 
+    const useHostAccessTokenFallback = oauthRequest === undefined && importModule !== defaultImportModule;
+    const vertexOAuth = createVertexOAuthClient({
+        ...(oauthRequest !== undefined ? { oauthRequest } : {}),
+        ...(oauthTimeoutMs !== undefined ? { timeoutMs: oauthTimeoutMs } : {}),
+        now,
+    });
+    const hasHostVertexFullHelpers = () => ['generateJWTToken', 'getAccessToken', 'getProjectIdFromServiceAccount']
+        .every(name => typeof googleModule[name] === 'function');
+    const readHostSecret = (directories, key, secretId) => {
+        if (!key) return '';
+        return secretId
+            ? secretsModule.readSecret(directories, key, secretId)
+            : secretsModule.readSecret(directories, key);
+    };
+
     const getGoogleApiConfig = async (request, model, endpoint) => {
         // Match the host: a reverse proxy owns its credentials for either
         // source, even when a saved profile also carries an explicit secret ID.
@@ -116,80 +136,113 @@ async function loadStRuntime({
         }
         const rawSecretId = request?.body?.secret_id ?? request?.body?.secretId;
         const secretId = typeof rawSecretId === 'string' ? rawSecretId.trim() : '';
-        if (!secretId) {
-            return googleModule.getGoogleApiConfig(request, model, endpoint);
-        }
+        const directories = request?.user?.directories;
 
         if (request?.body?.api === 'vertexai') {
-            const directories = request?.user?.directories;
-            const authMode = request.body.vertexai_auth_mode;
-            const region = request.body.vertexai_region;
+            if (!directories || typeof directories !== 'object') {
+                if (secretId) {
+                    throw new PluginError(400, 'EXPLICIT_SECRET_UNAVAILABLE', 'An authenticated user is required for explicit secret selection.');
+                }
+                throw new PluginError(401, 'AUTHENTICATED_USER_REQUIRED', 'An authenticated SillyTavern user is required.');
+            }
+            const requestedAuthMode = request.body.vertexai_auth_mode || 'express';
+            const region = request.body.vertexai_region || 'us-central1';
+            if (requestedAuthMode !== 'express' && requestedAuthMode !== 'full') {
+                if (secretId) {
+                    throw new PluginError(400, 'EXPLICIT_SECRET_UNSUPPORTED', 'Explicit secret selection is unsupported for this Vertex AI authentication mode.');
+                }
+                throw new PluginError(400, 'VERTEX_AUTH_CONFIGURATION_FAILED', 'Google authentication is unavailable for this configuration.');
+            }
+
+            let effectiveAuthMode = requestedAuthMode;
+            let credential = '';
+            if (secretId) {
+                if (requestedAuthMode === 'full') {
+                    if (useHostAccessTokenFallback && !hasHostVertexFullHelpers()) {
+                        throw new PluginError(400, 'EXPLICIT_SECRET_UNSUPPORTED', 'This host cannot authenticate an explicitly selected Vertex AI service account.');
+                    }
+                    credential = readHostSecret(directories, secretsModule.SECRET_KEYS.VERTEXAI_SERVICE_ACCOUNT, secretId);
+                    if ((typeof credential !== 'string' || !credential) && secretsModule.SECRET_KEYS.VERTEXAI) {
+                        const fallbackExpress = readHostSecret(directories, secretsModule.SECRET_KEYS.VERTEXAI, secretId);
+                        if (typeof fallbackExpress === 'string' && fallbackExpress) {
+                            credential = fallbackExpress;
+                            effectiveAuthMode = 'express';
+                        }
+                    }
+                    if (typeof credential !== 'string' || !credential) {
+                        throw new PluginError(400, 'EXPLICIT_SECRET_NOT_FOUND', 'The requested Vertex AI service account was not found.');
+                    }
+                } else {
+                    credential = readHostSecret(directories, secretsModule.SECRET_KEYS.VERTEXAI, secretId);
+                    if ((typeof credential !== 'string' || !credential) && secretsModule.SECRET_KEYS.VERTEXAI_SERVICE_ACCOUNT) {
+                        const fallbackFull = readHostSecret(directories, secretsModule.SECRET_KEYS.VERTEXAI_SERVICE_ACCOUNT, secretId);
+                        if (typeof fallbackFull === 'string' && fallbackFull) {
+                            if (useHostAccessTokenFallback && !hasHostVertexFullHelpers()) {
+                                throw new PluginError(400, 'EXPLICIT_SECRET_UNSUPPORTED', 'This host cannot authenticate an explicitly selected Vertex AI service account.');
+                            }
+                            credential = fallbackFull;
+                            effectiveAuthMode = 'full';
+                        }
+                    }
+                    if (typeof credential !== 'string' || !credential) {
+                        throw new PluginError(400, 'EXPLICIT_SECRET_NOT_FOUND', 'The requested Vertex AI Express secret was not found.');
+                    }
+                }
+            } else if (requestedAuthMode === 'full') {
+                if (useHostAccessTokenFallback && !hasHostVertexFullHelpers()) {
+                    throw new PluginError(400, 'VERTEX_AUTH_CONFIGURATION_FAILED', 'Google authentication is unavailable for this configuration.');
+                }
+                credential = readHostSecret(directories, secretsModule.SECRET_KEYS.VERTEXAI_SERVICE_ACCOUNT, '');
+                if (typeof credential !== 'string' || !credential) {
+                    throw new PluginError(400, 'VERTEX_SECRET_MISSING', 'Vertex AI service account JSON is missing.', {
+                        details: { authMode: 'full' },
+                    });
+                }
+            } else {
+                credential = readHostSecret(directories, secretsModule.SECRET_KEYS.VERTEXAI, '');
+                if (typeof credential !== 'string' || !credential) {
+                    throw new PluginError(400, 'VERTEX_SECRET_MISSING', 'Vertex AI Express API key is missing.', {
+                        details: { authMode: 'express' },
+                    });
+                }
+            }
+
             const host = region === 'global' ? 'aiplatform.googleapis.com' : `${region}-aiplatform.googleapis.com`;
             const baseUrl = `https://${host}/v1`;
-            if (!directories) {
-                const error = new Error('An authenticated user is required for explicit secret selection.');
-                error.code = 'EXPLICIT_SECRET_UNAVAILABLE';
-                throw error;
-            }
-            if (authMode === 'express') {
-                const apiKey = secretsModule.readSecret(directories, secretsModule.SECRET_KEYS.VERTEXAI, secretId);
-                if (typeof apiKey !== 'string' || !apiKey) {
-                    const error = new Error('The requested Vertex AI Express secret was not found.');
-                    error.code = 'EXPLICIT_SECRET_NOT_FOUND';
-                    throw error;
-                }
+            if (effectiveAuthMode === 'express') {
                 const projectId = request.body.vertexai_express_project_id;
                 const pathPrefix = projectId ? `/projects/${projectId}/locations/${region}` : '';
                 return {
                     url: `${baseUrl}${pathPrefix}/publishers/google/models/${model}:${endpoint}`,
-                    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
+                    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': credential },
                 };
             }
-            if (authMode === 'full') {
-                const requiredHelpers = ['generateJWTToken', 'getAccessToken', 'getProjectIdFromServiceAccount'];
-                if (requiredHelpers.some(name => typeof googleModule[name] !== 'function')) {
-                    const error = new Error('This host cannot authenticate an explicitly selected Vertex AI service account.');
-                    error.code = 'EXPLICIT_SECRET_UNSUPPORTED';
-                    throw error;
-                }
-                const serialized = secretsModule.readSecret(directories, secretsModule.SECRET_KEYS.VERTEXAI_SERVICE_ACCOUNT, secretId);
-                if (typeof serialized !== 'string' || !serialized) {
-                    const error = new Error('The requested Vertex AI service account was not found.');
-                    error.code = 'EXPLICIT_SECRET_NOT_FOUND';
-                    throw error;
-                }
-                try {
-                    const serviceAccount = JSON.parse(serialized);
-                    const projectId = googleModule.getProjectIdFromServiceAccount(serviceAccount);
-                    const jwtToken = await googleModule.generateJWTToken(serviceAccount);
-                    const accessToken = await googleModule.getAccessToken(jwtToken);
-                    if (typeof accessToken !== 'string' || !accessToken) throw new Error('Missing access token');
-                    return {
-                        url: `${baseUrl}/projects/${projectId}/locations/${region}/publishers/google/models/${model}:${endpoint}`,
-                        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${accessToken}` },
-                    };
-                } catch (cause) {
-                    const error = new Error('The selected Vertex AI service account could not be authenticated.', { cause });
-                    error.code = 'EXPLICIT_SECRET_UNAVAILABLE';
-                    throw error;
-                }
-            }
-            const error = new Error('Explicit secret selection is unsupported for this Vertex AI authentication mode.');
-            error.code = 'EXPLICIT_SECRET_UNSUPPORTED';
-            throw error;
+
+            const { projectId, accessToken, oauthCacheKey } = await vertexOAuth.authenticateServiceAccount({
+                userRoot: typeof directories.root === 'string' ? directories.root : '',
+                serialized: credential,
+                googleModule,
+                useHostAccessTokenFallback,
+            });
+            return {
+                url: `${baseUrl}/projects/${projectId}/locations/${region}/publishers/google/models/${model}:${endpoint}`,
+                headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${accessToken}` },
+                oauthCacheKey,
+            };
         }
 
-        const directories = request?.user?.directories;
-        if (!directories) {
-            const error = new Error('An authenticated user is required for explicit secret selection.');
-            error.code = 'EXPLICIT_SECRET_UNAVAILABLE';
-            throw error;
+        if (!directories || typeof directories !== 'object') {
+            if (secretId) {
+                throw new PluginError(400, 'EXPLICIT_SECRET_UNAVAILABLE', 'An authenticated user is required for explicit secret selection.');
+            }
+            throw new PluginError(401, 'AUTHENTICATED_USER_REQUIRED', 'An authenticated SillyTavern user is required.');
         }
-        const apiKey = secretsModule.readSecret(directories, secretsModule.SECRET_KEYS.MAKERSUITE, secretId);
+        const apiKey = readHostSecret(directories, secretsModule.SECRET_KEYS.MAKERSUITE, secretId);
         if (typeof apiKey !== 'string' || !apiKey) {
-            const error = new Error('The requested Google AI Studio secret was not found.');
-            error.code = 'EXPLICIT_SECRET_NOT_FOUND';
-            throw error;
+            if (secretId) {
+                throw new PluginError(400, 'EXPLICIT_SECRET_NOT_FOUND', 'The requested Google AI Studio secret was not found.');
+            }
+            throw new PluginError(400, 'GOOGLE_SECRET_MISSING', 'Google AI Studio API key is missing.');
         }
 
         const config = await googleModule.getGoogleApiConfig(request, model, endpoint);
@@ -208,7 +261,7 @@ async function loadStRuntime({
             const entries = secretsModule.readSecretState(directories)?.[secretKey];
             if (Array.isArray(entries)) secretId = entries.find(entry => entry?.active && typeof entry.id === 'string')?.id;
         }
-        const credential = secretsModule.readSecret(directories, secretKey, secretId);
+        const credential = readHostSecret(directories, secretKey, secretId);
         if (typeof credential !== 'string' || !credential) throw new PluginError(400, 'GOOGLE_SECRET_NOT_FOUND', 'The selected Google credential was not found.');
         return { connection: Object.freeze({ ...connection, ...(secretId ? { secretId } : {}) }), credentialSnapshot: secretId ? undefined : credential, logCredential: credential };
     };
@@ -224,33 +277,30 @@ async function loadStRuntime({
             }
         }
         if (source === 'makersuite') {
-            const apiKey = credentialSnapshot ?? secretsModule.readSecret(directories, secretsModule.SECRET_KEYS.MAKERSUITE, secretId);
+            const apiKey = credentialSnapshot ?? readHostSecret(directories, secretsModule.SECRET_KEYS.MAKERSUITE, secretId);
             if (!apiKey || typeof apiKey !== 'string') throw new PluginError(400, 'GOOGLE_SECRET_NOT_FOUND', 'The selected Google AI Studio secret was not found.');
             return { target: 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', headers: { Authorization: `Bearer ${apiKey}` }, logCredential: apiKey };
         }
         if (source !== 'vertexai' || connection.authMode !== 'full') throw new PluginError(400, 'VERTEX_AUTH_UNSUPPORTED', 'Vertex AI requires full service-account authentication.');
-        const helpers = ['generateJWTToken', 'getAccessToken', 'getProjectIdFromServiceAccount'];
-        if (helpers.some(name => typeof googleModule[name] !== 'function')) throw new PluginError(400, 'VERTEX_AUTH_UNSUPPORTED', 'The host cannot authenticate a Vertex service account.');
-        const serialized = credentialSnapshot ?? secretsModule.readSecret(directories, secretsModule.SECRET_KEYS.VERTEXAI_SERVICE_ACCOUNT, secretId);
+        if (useHostAccessTokenFallback && !hasHostVertexFullHelpers()) {
+            throw new PluginError(400, 'VERTEX_AUTH_UNSUPPORTED', 'The host cannot authenticate a Vertex service account.');
+        }
+        const serialized = credentialSnapshot ?? readHostSecret(directories, secretsModule.SECRET_KEYS.VERTEXAI_SERVICE_ACCOUNT, secretId);
         if (!serialized || typeof serialized !== 'string') throw new PluginError(400, 'GOOGLE_SECRET_NOT_FOUND', 'The selected Vertex service account was not found.');
-        let serviceAccount, projectId;
-        try {
-            serviceAccount = JSON.parse(serialized);
-            projectId = googleModule.getProjectIdFromServiceAccount(serviceAccount);
-        } catch {
-            throw new PluginError(400, 'VERTEX_AUTH_CONFIGURATION_FAILED', 'The Vertex service account is invalid.');
-        }
-        if (!/^[a-z][a-z0-9-]{4,62}$/u.test(projectId)) throw new PluginError(400, 'VERTEX_AUTH_CONFIGURATION_FAILED', 'The Vertex project ID is invalid.');
         const host = region === 'global' ? 'aiplatform.googleapis.com' : `${region}-aiplatform.googleapis.com`;
-        const target = `https://${host}/v1/projects/${projectId}/locations/${region}/endpoints/openapi/chat/completions`;
-        if (!authenticate) return { target, logCredential: serialized };
-        try {
-            const token = await googleModule.getAccessToken(await googleModule.generateJWTToken(serviceAccount));
-            if (typeof token !== 'string' || !token) throw new Error('Missing token');
-            return { target, headers: { Authorization: `Bearer ${token}` }, logCredential: serialized };
-        } catch {
-            throw new PluginError(502, 'VERTEX_AUTH_FAILED', 'The Vertex service account could not be authenticated.');
+        if (!authenticate) {
+            const { projectId } = vertexOAuth.validateServiceAccount(serialized, googleModule);
+            const target = `https://${host}/v1/projects/${projectId}/locations/${region}/endpoints/openapi/chat/completions`;
+            return { target, logCredential: serialized };
         }
+        const { projectId, accessToken, oauthCacheKey } = await vertexOAuth.authenticateServiceAccount({
+            userRoot: directories.root,
+            serialized,
+            googleModule,
+            useHostAccessTokenFallback,
+        });
+        const target = `https://${host}/v1/projects/${projectId}/locations/${region}/endpoints/openapi/chat/completions`;
+        return { target, headers: { Authorization: `Bearer ${accessToken}` }, logCredential: serialized, oauthCacheKey };
     };
 
     const listBridgeUsers = async () => {
@@ -334,6 +384,8 @@ async function loadStRuntime({
         listBridgeUsers,
         dataBackupContext,
         getNativeGeminiHelpers,
+        invalidateOAuthToken: cacheKey => vertexOAuth.invalidate(cacheKey),
+        clearOAuthCache: () => vertexOAuth.clear(),
         ...(readSavedSettings ? { readSavedSettings } : {}),
     });
 }

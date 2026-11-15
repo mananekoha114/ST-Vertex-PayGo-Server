@@ -35,13 +35,14 @@ async function init(router) {
 
     const logStore = new LogStore({ rootDir: process.cwd() });
     logStore.server('info', 'plugin_initializing');
+    let stRuntime;
     let ticketStore;
     let loopbackTransport;
     let openaiBridge;
     let bridgeListener;
     const usageStore = new UsageStore();
     try {
-        const stRuntime = await loadStRuntime();
+        stRuntime = await loadStRuntime();
         const dataBackups = createDataBackups({ runtime: stRuntime, logStore });
         // Apply queued restores before any PayGo listener or request handler
         // can access the ledger or restore the persisted bridge configuration.
@@ -54,7 +55,12 @@ async function init(router) {
         });
         ticketStore = new TicketStore();
         openaiBridge = createOpenAIBridge({ stRuntime, bridgeLogStore: new BridgeLogStore(), stateStore: new BridgeStateStore() });
-        loopbackTransport = createLoopbackTransport({ ticketStore, logStore, usageStore });
+        loopbackTransport = createLoopbackTransport({
+            ticketStore,
+            logStore,
+            usageStore,
+            onUpstreamUnauthorized: cacheKey => stRuntime.invalidateOAuthToken?.(cacheKey),
+        });
         await loopbackTransport.start();
         try {
             const port = await readBridgePort();
@@ -71,7 +77,7 @@ async function init(router) {
             console.warn(`[Vertex PayGo] ${error.code}: ${error.message}`);
         }
         registerRoutes(router, { stRuntime, ticketStore, loopbackTransport, logStore, usageStore, openaiBridge, updater, dataBackups });
-        activeState = { ticketStore, loopbackTransport, logStore, usageStore, openaiBridge, bridgeListener };
+        activeState = { stRuntime, ticketStore, loopbackTransport, logStore, usageStore, openaiBridge, bridgeListener };
         logStore.server('info', 'plugin_ready', {
             hostName: stRuntime.hostName,
             hostVersion: stRuntime.stVersion,
@@ -79,6 +85,7 @@ async function init(router) {
     } catch (error) {
         logStore.server('error', 'plugin_initialization_failed', describeError(error));
         try {
+            stRuntime?.clearOAuthCache?.();
             ticketStore?.close();
             openaiBridge?.close();
             await bridgeListener?.close();
@@ -97,6 +104,7 @@ async function exit() {
     activeState = undefined;
     if (!state) return;
     state.logStore.server('info', 'plugin_stopping');
+    state.stRuntime?.clearOAuthCache?.();
     state.ticketStore.close();
     state.openaiBridge.close();
     try {

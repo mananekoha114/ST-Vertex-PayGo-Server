@@ -290,7 +290,13 @@ function createOpenAIBridge({ stRuntime, upstreamRequest = https.request, maxBod
                         tap.once('close', () => source.destroy());
                         callback(tap); source.pipe(tap);
                     });
-                    const catalog = await discoverModels({ config, connection: state.connection, upstreamRequest: entry ? discoveryRequest : upstreamRequest, operation });
+                    let catalog;
+                    try {
+                        catalog = await discoverModels({ config, connection: state.connection, upstreamRequest: entry ? discoveryRequest : upstreamRequest, operation });
+                    } catch (discoveryError) {
+                        if (discoveryError?.status === 401 && config.oauthCacheKey) stRuntime.invalidateOAuthToken?.(config.oauthCacheKey);
+                        throw discoveryError;
+                    }
                     if (operation.terminal || !catalog) return;
                     done(); response.setHeader('Content-Type', 'application/json'); response.end(JSON.stringify(catalog)); return;
                 }
@@ -349,6 +355,7 @@ function createOpenAIBridge({ stRuntime, upstreamRequest = https.request, maxBod
                 const upstream = upstreamRequest(target, { method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': body.length, 'Accept-Encoding': 'identity', Authorization: config.headers.Authorization, ...policyHeaders } }, upstreamResponse => {
                     if (operation.terminal || response.writableEnded || response.destroyed) { upstreamResponse.destroy(); return; }
                     const status = upstreamResponse.statusCode || 502;
+                    if (status === 401 && config.oauthCacheKey) stRuntime.invalidateOAuthToken?.(config.oauthCacheKey);
                     if (entry) { entry.status = status; if (status >= 400) entry.error = `GOOGLE_HTTP_ERROR: HTTP ${status}`; }
                     if (status >= 300 && status < 400) { upstreamResponse.destroy(); fail(502, 'GOOGLE_REDIRECT_REJECTED', 'Google returned a redirect.'); return; }
                     if (gateway) {
