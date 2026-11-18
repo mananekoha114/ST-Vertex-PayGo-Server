@@ -1,5 +1,46 @@
 # 更新日志
 
+## 0.6.1 · 2026-11-18 · Carbon / Hydrogen / Neon、宿主反向代理与 Vertex OAuth
+
+与前端 `v0.6.1` 配套发布，协议升级为 **v3**，包含下方 0.6.1-pre1 的全部修复。
+
+### Gemini 4 Carbon、Hydrogen 与 Neon
+
+- `gemini-4-carbon`、`gemini-4-hydrogen` 与 `gemini-4-neon` 加入共享模型名单 `src/gemini4-models.cjs`。原生生成接口、续传传输、Vertex `v1beta1` 目标放行与反代分派都覆盖这些模型。
+- `/prepare` 响应新增 `nativeGemini4Models`，前端据此在改写请求前拒绝本服务端不支持的模型。
+- Hydrogen：宿主的最高推理档位映射为 `XHIGH`，其他模型仍为 `HIGH`；自动档不发送档位，使用模型默认值（Hydrogen 为 `HIGH`）。Vertex 的 Hydrogen 请求设置 `thinkingConfig.prefixMismatchBehavior: DROP`，较早轮次或系统提示词与签名签发时不同时不再返回 HTTP 400；AI Studio 的 `ThinkingConfig` 没有该字段，不会发送。
+- Hydrogen 的非流式单段上限为 65,536，续传传输不假定单段上限，无需修改。
+- Neon（尚未上线，提前接入）：最高推理档位保持 `HIGH`，Vertex 请求同样设置 `prefixMismatchBehavior: DROP`，AI Studio 不发送。Google 公布 Neon 的档位与签名规则后再按官方文档调整。
+
+### 宿主反向代理
+
+- 回环代理为 AI Studio 与 Vertex AI 都转发到宿主 API 设置中的反向代理，取代此前仅支持 AI Studio 的实现。`/prepare` 不再以 `UPSTREAM_PROXY_UNSUPPORTED` 拒绝 Vertex 的 `reverse_proxy` / `proxy_password`。
+- 反代收到与宿主原生请求相同的请求：AI Studio 的代理密码以 `?key=` 传递（为空也发送），Vertex 保留 `Authorization: Bearer`；沿用宿主的 `User-Agent` 与 `Accept`，缺失时使用 node-fetch 的默认值；去掉 `Accept-Encoding`，以便用量采集读取未压缩的正文；请求体在现有上限内缓冲后带 `Content-Length` 发出。
+- 修复分块上传与 ais2api 等反代的冲突：这类反代会为长度未知的请求体按 `request_bytes*4` 预留准入额度，并在整个生成期间占用，导致流式生成期间的第二个请求返回 429 `memory_budget`；`request_bytes` 达到 64 MiB 后，每个请求都会如此。
+- 代理模式接受宿主原生转发的模型名（`gemini-` 前缀不分大小写，允许大小写混合或带后缀的别名）。两种来源的票据都绑定已保存的反代 origin 与路径前缀，Gemini 4 的 Vertex 目标在反代前缀之后改写为 `v1beta1`。反代错误中的密码会被隐去。Vertex 的 Flex 与 Priority 仍要求 `global` 区域。
+- 反代语义集中在 `src/upstream-proxy.cjs`；`test/reverse-proxy.test.cjs` 取代 `test/ai-studio-proxy.test.cjs`。
+
+### Vertex OAuth
+
+- 官方 Vertex Full 端点不再调用宿主不透明的 `getAccessToken`，改用专用 OAuth 客户端 `src/vertex-oauth.cjs`，区分本地服务账号校验 / 签名与远端令牌交换：
+  - 服务账号无效：400 `VERTEX_INVALID_SERVICE_ACCOUNT`。
+  - 上游 500–504 与 429：保留原状态码（`VERTEX_OAUTH_UPSTREAM_ERROR` / `VERTEX_OAUTH_RATE_LIMITED`）；其他异常状态、意外重定向和无效响应返回 502。
+  - 超时：504 `VERTEX_OAUTH_TIMEOUT`；套接字 / DNS 失败：502 `VERTEX_OAUTH_NETWORK_FAILED`。
+  - Google OAuth 以 JSON 拒绝：400 `VERTEX_OAUTH_REJECTED`，错误详情经过脱敏。
+  - 以上都不会以 HTTP 401 返回，避免触发 SillyTavern 的 Basic 认证。
+- 访问令牌按用户目录与服务账号摘要缓存在内存中：提前 5 分钟刷新，并发请求合并为一次交换，下游 Vertex 返回 HTTP 401 时自动作废，进程退出时清理。
+- 当前密钥缺失时返回 400 `GOOGLE_SECRET_MISSING` / `VERTEX_SECRET_MISSING`。请求提供显式 `secret_id` UUID 时，在 Vertex 的各类密钥中查找并推断 Express 或 Full 模式。
+- 诊断日志白名单加入安全的 OAuth 诊断字段。Vertex OAuth 的 5xx 与网络失败按普通优先级记录，不再归入低优先级预算。
+
+### 宿主控制台日志
+
+- Gemini 4 原生调用在 ST / Luker 服务端控制台输出 `Google AI Studio request:` / `Google Vertex AI request:`、非流式 `response:`，以及流式开始、完成、失败或取消状态；完成摘要包含耗时、结束原因与汇总用量。
+- 请求与非流式响应正文使用 `console.debug`，可见性跟随宿主日志等级，**包含提示词与模型输出**。不打印认证头、代理地址与凭据，签名与续传 token 从控制台副本中移除，流式输出不逐帧打印。`st-vertex-paygo.log` 诊断文件仍不记录正文。
+
+### 升级说明
+
+- 协议升级为 **v3**，v2 前端会以 `PROTOCOL_MISMATCH` 被拒绝。需与前端同时更新，然后重启宿主并刷新前端页面。
+
 ## 0.6.1-pre1 · 2026-10-23 · 预发布：Argon 不出字修复
 
 预发布版本，与前端 `v0.6.1-pre1` 配套，协议保持 v2。
