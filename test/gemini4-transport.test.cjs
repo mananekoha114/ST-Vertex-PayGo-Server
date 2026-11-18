@@ -69,9 +69,9 @@ test('missing token does not continue; repeated token fails', async () => {
     await assert.rejects(fixture(false, [value('x', 'CONTINUATION', 'same', 10), value('y', 'CONTINUATION', 'same', 10)]), /continuation limit/u);
 });
 test('model gate and beta target remain tightly scoped', () => {
-    for (const model of ['gemini-4-hydrogen', 'gemini-4-carbon', 'gemini-4-argon', 'gemini-4-argon-cyber-permissive']) assert.equal(isGemini4Model(model), true);
-    for (const model of ['gemini-3-pro', 'gemini-4-carbon-preview', 'gemini-4-hydrogen-preview', 'gemini-4']) assert.equal(isGemini4Model(model), false);
-    for (const model of ['gemini-4-hydrogen', 'gemini-4-carbon']) {
+    for (const model of ['gemini-4-neon', 'gemini-4-hydrogen', 'gemini-4-carbon', 'gemini-4-argon', 'gemini-4-argon-cyber-permissive']) assert.equal(isGemini4Model(model), true);
+    for (const model of ['gemini-3-pro', 'gemini-4-carbon-preview', 'gemini-4-hydrogen-preview', 'gemini-4-neon-preview', 'gemini-4']) assert.equal(isGemini4Model(model), false);
+    for (const model of ['gemini-4-neon', 'gemini-4-hydrogen', 'gemini-4-carbon']) {
         assert.equal(validatePreparedGoogleTarget(`https://aiplatform.googleapis.com/v1beta1/publishers/google/models/${model}:generateContent`, {model, region: 'global', stream: false}).pathname, `/v1beta1/publishers/google/models/${model}:generateContent`);
     }
     assert.throws(() => validatePreparedGoogleTarget('https://aiplatform.googleapis.com/v1beta1/publishers/google/models/gemini-3-pro:generateContent', {model: 'gemini-3-pro', region: 'global', stream: false}));
