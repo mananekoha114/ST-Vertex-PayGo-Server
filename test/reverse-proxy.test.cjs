@@ -392,3 +392,111 @@ test('a host endpoint outside the selected proxy fails preparation without issui
         }
     }
 });
+
+test('makersuite base_url validation enforces URL rules, proxy model names, and rejects vertexai', () => {
+    const valid = validatePreparePayload(body('makersuite', {
+        base_url: 'https://custom.example/v1/gw///',
+        model: 'Gemini-2.5-Pro',
+        tier: 'standard',
+    }));
+    assert.equal(valid.baseUrl, 'https://custom.example/v1/gw');
+    assert.equal(valid.reverseProxy, undefined);
+    assert.equal(valid.model, 'Gemini-2.5-Pro');
+
+    // Empty base_url is ignored and keeps canonical model validation.
+    const empty = validatePreparePayload(body('makersuite', { base_url: '', tier: 'standard' }));
+    assert.equal(empty.baseUrl, undefined);
+
+    // Non-makersuite base_url is rejected with 400.
+    assert.throws(
+        () => validatePreparePayload(body('vertexai', { base_url: 'https://custom.example' })),
+        error => error.status === 400 && error.code === 'INVALID_PREPARE_REQUEST',
+    );
+
+    // Malformed base_url is rejected with 400.
+    for (const badBase of [null, 123, 'file:///tmp', 'ftp://example.com', 'https://u:p@example.com',
+        'https://example.com/?key=private', 'https://example.com/#frag', ' https://example.com']) {
+        assert.throws(
+            () => validatePreparePayload(body('makersuite', { base_url: badBase, tier: 'standard' })),
+            error => error.status === 400,
+        );
+    }
+});
+
+test('host runtime reads MakerSuite secret for base_url and routes to custom endpoint end to end', async () => {
+    const calls = [];
+    let currentSecret = 'saved-makersuite-key';
+    const runtime = await loadStRuntime({
+        rootDir: 'C:\\fake-host',
+        readFile: async () => JSON.stringify({ name: 'luker', version: '2.9.0-rc.2' }),
+        fileExists: () => false,
+        importModule: async specifier => specifier.endsWith('/secrets.js')
+            ? {
+                SECRET_KEYS: { MAKERSUITE: 'makersuite', VERTEXAI: 'vertexai' },
+                readSecret(_dirs, key, secretId) {
+                    assert.equal(key, 'makersuite');
+                    if (secretId === 'missing-id') return '';
+                    return currentSecret;
+                },
+            }
+            : {
+                getGoogleApiConfig: async (request, model, endpoint) => {
+                    calls.push(request.body);
+                    return {
+                        url: hostProxyUrl('makersuite', request.body.reverse_proxy, model, endpoint),
+                        headers: hostProxyHeaders('makersuite', request.body.proxy_password),
+                    };
+                },
+            },
+    });
+
+    // Missing MakerSuite secret must fail cleanly.
+    currentSecret = '';
+    await assert.rejects(
+        () => runtime.getGoogleApiConfig({ body: { api: 'makersuite', base_url: 'https://custom.example' }, user: USER }, 'gemini-2.5-pro', 'generateContent'),
+        error => error.status === 400 && error.code === 'GOOGLE_SECRET_MISSING',
+    );
+    await assert.rejects(
+        () => runtime.getGoogleApiConfig({ body: { api: 'makersuite', base_url: 'https://custom.example', secret_id: 'missing-id' }, user: USER }, 'gemini-2.5-pro', 'generateContent'),
+        error => error.status === 400 && error.code === 'EXPLICIT_SECRET_NOT_FOUND',
+    );
+
+    // Present MakerSuite secret flows through prepare -> loopback -> upstream as ?key=.
+    currentSecret = 'saved-makersuite-key';
+    const upstreamRequests = [];
+    const upstream = http.createServer(async (req, res) => {
+        for await (const chunk of req) void chunk;
+        upstreamRequests.push({ url: req.url, headers: req.headers });
+        res.setHeader('Content-Type', 'application/json');
+        res.end(geminiReply(false));
+    });
+    await listen(upstream);
+    const baseUrl = `http://127.0.0.1:${upstream.address().port}/custom/gw`;
+    const ticketStore = new TicketStore();
+    const transport = createLoopbackTransport({ ticketStore });
+    await transport.start();
+    try {
+        const prepare = createPrepareHandler({ stRuntime: runtime, ticketStore, loopbackTransport: transport });
+        const prepared = response();
+        await prepare({
+            body: body('makersuite', { base_url: `${baseUrl}/`, tier: 'standard', stream: false }),
+            user: USER,
+        }, prepared);
+        assert.equal(prepared.statusCode, 200, JSON.stringify(prepared.body));
+        assert.doesNotMatch(JSON.stringify(prepared.body), /saved-makersuite-key|custom\/gw/u);
+        assert.equal(calls.length, 1);
+        assert.equal(calls[0].reverse_proxy, baseUrl);
+        assert.equal(calls[0].proxy_password, 'saved-makersuite-key');
+
+        const native = nativeLoopbackRequest('makersuite', prepared.body, 'gemini-2.5-pro', false);
+        const result = await post(native.url, { payload: '{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}' });
+        assert.equal(result.status, 200, result.text);
+        assert.equal(upstreamRequests.length, 1);
+        assert.equal(upstreamRequests[0].url, '/custom/gw/v1beta/models/gemini-2.5-pro:generateContent?key=saved-makersuite-key');
+        assert.equal(upstreamRequests[0].headers['x-goog-api-key'], undefined);
+    } finally {
+        ticketStore.close();
+        await transport.close();
+        await close(upstream);
+    }
+});

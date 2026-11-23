@@ -29,6 +29,41 @@ function validateChatId(value) {
     return requireCanonicalString(value, 'usage chat ID', /^[A-Za-z0-9][A-Za-z0-9._:-]*$/u, 128);
 }
 
+function validateUsageIds(rawIds, { maxIds = 50 } = {}) {
+    let parts;
+    if (typeof rawIds === 'string') {
+        parts = rawIds.split(',');
+    } else if (Array.isArray(rawIds)) {
+        parts = [];
+        for (const entry of rawIds) {
+            if (typeof entry !== 'string') {
+                throw new PluginError(400, 'INVALID_USAGE_IDS', 'Invalid usage IDs.');
+            }
+            parts.push(...entry.split(','));
+        }
+    } else {
+        throw new PluginError(400, 'INVALID_USAGE_IDS', 'Invalid usage IDs.');
+    }
+    if (parts.length === 0 || parts.length > maxIds) {
+        throw new PluginError(400, 'INVALID_USAGE_IDS', `Between 1 and ${maxIds} usage IDs are required.`);
+    }
+    const unique = [];
+    const seen = new Set();
+    for (const part of parts) {
+        if (!/^[A-Za-z0-9._:-]{1,128}$/u.test(part)) {
+            throw new PluginError(400, 'INVALID_USAGE_IDS', 'Invalid usage ID.');
+        }
+        if (!seen.has(part)) {
+            seen.add(part);
+            unique.push(part);
+        }
+    }
+    if (unique.length === 0 || unique.length > maxIds) {
+        throw new PluginError(400, 'INVALID_USAGE_IDS', `Between 1 and ${maxIds} usage IDs are required.`);
+    }
+    return unique;
+}
+
 function validateUsagePrice(value) {
     if (value === undefined || value === null) return null;
     if (typeof value !== 'object' || Array.isArray(value)) {
@@ -78,10 +113,20 @@ function validatePreparePayload(body) {
         throw new PluginError(400, 'GOOGLE_ONLY', 'Only the Vertex AI and Google AI Studio sources are supported.');
     }
     const upstreamProxy = validateReverseProxy(body);
+    let baseUrl;
+    if (body.base_url !== undefined && body.base_url !== '') {
+        if (source !== 'makersuite') {
+            throw new PluginError(400, 'INVALID_PREPARE_REQUEST', 'Custom base_url is only supported for Google AI Studio.');
+        }
+        if (!upstreamProxy) {
+            baseUrl = validateReverseProxy({ reverse_proxy: body.base_url }).reverseProxy;
+        }
+    }
     // Official endpoints accept only canonical Google model IDs. A reverse proxy
-    // receives whatever Gemini-prefixed name SillyTavern would send it natively.
+    // or custom AI Studio base URL receives whatever Gemini-prefixed name
+    // SillyTavern would send it natively.
     let model;
-    if (!upstreamProxy) {
+    if (!upstreamProxy && !baseUrl) {
         model = requireCanonicalString(body.model, 'model', /^gemini-[a-z0-9][a-z0-9._-]*$/u);
     } else if (isProxyModel(body.model)) {
         model = body.model;
@@ -126,6 +171,7 @@ function validatePreparePayload(body) {
         protocolVersion: PROTOCOL_VERSION,
         source,
         ...(upstreamProxy || {}),
+        ...(baseUrl ? { baseUrl } : {}),
         model,
         region,
         authMode,
@@ -148,5 +194,6 @@ module.exports = {
     TIERS,
     validateChatId,
     validatePreparePayload,
+    validateUsageIds,
     validateUsagePrice,
 };

@@ -81,6 +81,8 @@ function createPrepareHandler({ stRuntime, ticketStore, loopbackTransport, logSt
             if (config.reverseProxy) {
                 syntheticBody.reverse_proxy = config.reverseProxy;
                 syntheticBody.proxy_password = config.proxyPassword;
+            } else if (config.baseUrl) {
+                syntheticBody.base_url = config.baseUrl;
             }
 
             // Only the validated reverse-proxy settings reach the host helper.
@@ -108,13 +110,17 @@ function createPrepareHandler({ stRuntime, ticketStore, loopbackTransport, logSt
                 );
             }
 
-            const targetUrl = prepareGoogleTarget(googleConfig.url, config);
+            const upstreamBase = config.reverseProxy ?? config.baseUrl;
+            const targetUrl = prepareGoogleTarget(
+                googleConfig.url,
+                upstreamBase ? { ...config, reverseProxy: upstreamBase } : config,
+            );
             const preparedHeaders = prepareGoogleHeaders(googleConfig.headers, buildPayGoHeaders(config), {
                 allowUnauthenticated: Boolean(config.reverseProxy),
             });
             // The host returns a Studio proxy credential as a header; the proxy
             // receives it as ?key= like SillyTavern's own chat request.
-            const { headers, proxyKey } = config.reverseProxy && config.source === 'makersuite'
+            const { headers, proxyKey } = upstreamBase && config.source === 'makersuite'
                 ? takeProxyKey(preparedHeaders) : { headers: preparedHeaders };
             if (request.aborted || response.destroyed) {
                 logStore?.server('warn', 'prepare_client_disconnected', prepareLogContext(config, startedAt));
@@ -141,7 +147,7 @@ function createPrepareHandler({ stRuntime, ticketStore, loopbackTransport, logSt
                 targetUrl,
                 headers,
                 source: config.source,
-                ...(config.reverseProxy ? { reverseProxy: config.reverseProxy } : {}),
+                ...(upstreamBase ? { reverseProxy: upstreamBase } : {}),
                 ...(proxyKey !== undefined ? { proxyKey } : {}),
                 ...(typeof googleConfig.oauthCacheKey === 'string' && googleConfig.oauthCacheKey
                     ? { oauthCacheKey: googleConfig.oauthCacheKey }

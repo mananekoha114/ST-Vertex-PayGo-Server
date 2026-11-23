@@ -64,3 +64,83 @@ test('occupied fixed port fails without random fallback; separate main transport
     assert.equal((await fetch(`${transport.baseUrl}/openai/v1/models`)).status, 405);
     await listener.close();
 });
+
+test('readBridgePort prefers primary config, migrates valid legacy config, and rejects invalid legacy config', async t => {
+    const base = await fs.mkdtemp(path.join(os.tmpdir(), 'bridge-legacy-'));
+    t.after(() => fs.rm(base, { recursive: true, force: true }));
+
+    const primaryDir = path.join(base, 'data', 'vertex-paygo');
+    const legacyDir = path.join(base, 'legacy');
+    await fs.mkdir(legacyDir, { recursive: true });
+
+    // Valid legacy file is read and migrated into primaryDir
+    await fs.writeFile(path.join(legacyDir, CONFIG_FILE), '{"port":24567}\n');
+    assert.equal(await readBridgePort(primaryDir, { legacyRootDir: legacyDir }), 24567);
+    assert.deepEqual(JSON.parse(await fs.readFile(path.join(primaryDir, CONFIG_FILE), 'utf8')), { port: 24567 });
+
+    // Primary config takes precedence over legacy once present
+    await fs.writeFile(path.join(legacyDir, CONFIG_FILE), '{"port":29999}\n');
+    assert.equal(await readBridgePort(primaryDir, { legacyRootDir: legacyDir }), 24567);
+
+    // Invalid legacy config still throws BRIDGE_CONFIG_INVALID when primary is absent
+    await fs.rm(path.join(primaryDir, CONFIG_FILE));
+    for (const invalid of ['{', '{"port":80}', '{"port":18443,"extra":true}', ' '.repeat(5000)]) {
+        await fs.writeFile(path.join(legacyDir, CONFIG_FILE), invalid);
+        await assert.rejects(
+            readBridgePort(primaryDir, { legacyRootDir: legacyDir }),
+            { code: 'BRIDGE_CONFIG_INVALID' },
+        );
+    }
+});
+
+test('readBridgePort tolerates read-only primary directory on legacy migration and default fallback', async t => {
+    const base = await fs.mkdtemp(path.join(os.tmpdir(), 'bridge-ro-'));
+    t.after(() => fs.rm(base, { recursive: true, force: true }));
+
+    const primaryDir = path.join(base, 'readonly-data');
+    const legacyDir = path.join(base, 'legacy');
+    await fs.mkdir(legacyDir, { recursive: true });
+    await fs.writeFile(path.join(legacyDir, CONFIG_FILE), '{"port":22222}\n');
+
+    for (const code of ['EROFS', 'EACCES', 'EPERM', 'ENOENT']) {
+        const roFs = {
+            stat: fs.stat,
+            readFile: fs.readFile,
+            async mkdir() {
+                const error = new Error(`readonly ${code}`);
+                error.code = code;
+                throw error;
+            },
+            async writeFile() {
+                const error = new Error(`readonly ${code}`);
+                error.code = code;
+                throw error;
+            },
+            rename: fs.rename,
+            unlink: fs.unlink,
+        };
+
+        // Legacy present + read-only primary -> returns legacy port without throwing
+        assert.equal(await readBridgePort(primaryDir, { legacyRootDir: legacyDir, fsModule: roFs }), 22222);
+
+        // Neither present + read-only primary -> returns DEFAULT_BRIDGE_PORT without throwing 503
+        const emptyLegacy = path.join(base, 'empty-legacy');
+        assert.equal(await readBridgePort(primaryDir, { legacyRootDir: emptyLegacy, fsModule: roFs }), DEFAULT_BRIDGE_PORT);
+    }
+
+    // Unexpected non-read-only write error still throws BRIDGE_CONFIG_FAILED
+    const ioErrorFs = {
+        stat: fs.stat,
+        readFile: fs.readFile,
+        async mkdir() {},
+        async writeFile() {
+            const error = new Error('disk I/O failure');
+            error.code = 'EIO';
+            throw error;
+        },
+    };
+    await assert.rejects(
+        readBridgePort(path.join(base, 'no-such-dir'), { fsModule: ioErrorFs }),
+        { code: 'BRIDGE_CONFIG_FAILED' },
+    );
+});

@@ -15,7 +15,7 @@ const path = require('node:path');
 const { UsageCapture } = require('../src/usage-capture.cjs');
 const { UsageStore } = require('../src/usage-store.cjs');
 const { createUsageHandler } = require('../src/usage-route.cjs');
-const { validatePreparePayload } = require('../src/protocol.cjs');
+const { validatePreparePayload, validateUsageIds } = require('../src/protocol.cjs');
 const { buildPayGoHeaders } = require('../src/header-policy.cjs');
 const { createLoopbackTransport } = require('../src/loopback-server.cjs');
 const { TicketStore } = require('../src/ticket-store.cjs');
@@ -248,3 +248,100 @@ for (const stream of [true, false]) {
         }
     });
 }
+
+test('validateUsageIds parses, deduplicates, and enforces format and batch limits', () => {
+    assert.deepEqual(validateUsageIds('id-1,id-2,id-1,id:3.a_b'), ['id-1', 'id-2', 'id:3.a_b']);
+    assert.deepEqual(validateUsageIds(['id-a,id-b', 'id-c', 'id-a']), ['id-a', 'id-b', 'id-c']);
+    assert.equal(validateUsageIds(Array.from({ length: 50 }, (_, index) => `id-${index}`).join(',')).length, 50);
+
+    for (const invalid of [
+        undefined,
+        null,
+        '',
+        [],
+        'id-1,,id-2',
+        'id-1, id-2',
+        'id/1',
+        'a'.repeat(129),
+        [123],
+        Array.from({ length: 51 }, (_, index) => `id-${index}`).join(','),
+        Array.from({ length: 51 }, () => 'same-id').join(','),
+    ]) {
+        assert.throws(() => validateUsageIds(invalid), error => error.status === 400 && error.code === 'INVALID_USAGE_IDS');
+    }
+});
+
+test('usage store getByIds isolates chats/users and recovers stale pending records', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vertex-usage-by-ids-'));
+    const userA = { directories: { root: path.join(root, 'a') } };
+    const userB = { directories: { root: path.join(root, 'b') } };
+    let now = Date.UTC(2026, 0, 1);
+    try {
+        const store = new UsageStore({ now: () => now, pendingTimeoutMs: 1000 });
+        const first = store.create(userA, {
+            chatId: 'chat-a', model: 'gemini-2.5-pro', source: 'vertexai', tier: 'standard',
+            region: 'global', stream: false, price: null,
+        });
+        const second = store.create(userA, {
+            chatId: 'chat-a', model: 'gemini-2.5-pro', source: 'vertexai', tier: 'standard',
+            region: 'global', stream: true, price: null,
+        });
+        const otherChat = store.create(userA, {
+            chatId: 'chat-other', model: 'gemini-2.5-pro', source: 'vertexai', tier: 'standard',
+            region: 'global', stream: false, price: null,
+        });
+        store.update(first, { status: 'complete', usage: { promptTokenCount: 3, candidatesTokenCount: 5 } });
+
+        now += 1001;
+        const result = store.getByIds(userA, 'chat-a', [second.id, otherChat.id, 'missing-id', first.id]);
+        assert.equal(result.truncated, false);
+        assert.deepEqual(result.records.map(record => record.id), [second.id, first.id]);
+        assert.equal(result.records[0].status, 'incomplete');
+        assert.equal(result.records[0].errorCode, 'USAGE_CAPTURE_TIMEOUT');
+        assert.equal(result.records[1].status, 'complete');
+        assert.deepEqual(store.getByIds(userB, 'chat-a', [first.id, second.id]), { records: [], truncated: false });
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+});
+
+test('usage route handles ?ids batch lookups and rejects invalid or mixed pagination params', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vertex-usage-route-ids-'));
+    const user = { directories: { root } };
+    const store = new UsageStore();
+    const makeRes = () => ({ statusCode: 200, headers: {}, set(name, value) { this.headers[name] = value; }, status(code) { this.statusCode = code; return this; }, json(body) { this.body = body; return this; } });
+    try {
+        const a = store.create(user, { chatId: 'chat-1', model: 'gemini-2.5-pro', source: 'makersuite', tier: 'standard', region: null, stream: false, price: null });
+        const b = store.create(user, { chatId: 'chat-2', model: 'gemini-2.5-pro', source: 'makersuite', tier: 'standard', region: null, stream: false, price: null });
+        const handler = createUsageHandler({ usageStore: store });
+
+        const ok = makeRes();
+        handler({ query: { chatId: 'chat-1', ids: `${a.id},${b.id},${a.id}` }, user }, ok);
+        assert.equal(ok.statusCode, 200);
+        assert.equal(ok.body.ok, true);
+        assert.equal(ok.body.truncated, false);
+        assert.deepEqual(ok.body.records.map(record => record.id), [a.id]);
+
+        const mixedLimit = makeRes();
+        handler({ query: { chatId: 'chat-1', ids: a.id, limit: '10' }, user }, mixedLimit);
+        assert.equal(mixedLimit.statusCode, 400);
+        assert.equal(mixedLimit.body.code, 'INVALID_USAGE_PAGE');
+
+        const mixedCursor = makeRes();
+        handler({ query: { chatId: 'chat-1', ids: a.id, cursor: 'abc' }, user }, mixedCursor);
+        assert.equal(mixedCursor.statusCode, 400);
+        assert.equal(mixedCursor.body.code, 'INVALID_USAGE_PAGE');
+
+        const badIds = makeRes();
+        handler({ query: { chatId: 'chat-1', ids: '' }, user }, badIds);
+        assert.equal(badIds.statusCode, 400);
+        assert.equal(badIds.body.code, 'INVALID_USAGE_IDS');
+
+        const tooMany = makeRes();
+        handler({ query: { chatId: 'chat-1', ids: Array.from({ length: 51 }, (_, i) => `u-${i}`).join(',') }, user }, tooMany);
+        assert.equal(tooMany.statusCode, 400);
+        assert.equal(tooMany.body.code, 'INVALID_USAGE_IDS');
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+});

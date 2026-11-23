@@ -30,6 +30,7 @@ const ERROR_CODE_PATTERN = /^[A-Za-z][A-Za-z0-9_.:-]{0,127}$/u;
 const IDENTIFIER_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/u;
 const REGION_PATTERN = /^(?:global|[a-z0-9][a-z0-9-]{0,62})$/u;
 const SENSITIVE_DETAIL_KEY_PATTERN = /(?:authorization|apiKey|token|secret|password|credential|cookie|body|prompt|response|content|ticket|proxy|url|headers?)/iu;
+const READ_ONLY_FALLBACK_CODES = new Set(['EROFS', 'EACCES', 'EPERM', 'ENOENT']);
 
 const CLIENT_DETAIL_VALIDATORS = Object.freeze({
     clientVersion: value => isBoundedIdentifier(value, 64),
@@ -161,6 +162,7 @@ class LogStore {
         maxLowPriorityBytes,
         now = () => new Date(),
         fsModule = fs,
+        allowReadOnlyFallback = false,
     } = {}) {
         if (!Number.isSafeInteger(maxFileBytes) || maxFileBytes < 1024) {
             throw new TypeError('Invalid log file size limit.');
@@ -196,8 +198,21 @@ class LogStore {
         this.clientAtCapacity = false;
         this.lowPriorityAtCapacity = false;
         this.disabled = false;
-        // Opening with `w` is intentional: every host start begins a fresh log.
-        this.fileDescriptor = this.fs.openSync(this.filePath, 'w', 0o600);
+        this.degradedReason = undefined;
+        try {
+            this.fs.mkdirSync?.(path.dirname(this.filePath), { recursive: true, mode: 0o700 });
+            // Opening with `w` is intentional: every host start begins a fresh log.
+            this.fileDescriptor = this.fs.openSync(this.filePath, 'w', 0o600);
+        } catch (error) {
+            if (allowReadOnlyFallback && READ_ONLY_FALLBACK_CODES.has(error?.code)) {
+                this.disabled = true;
+                this.fileDescriptor = undefined;
+                this.degradedReason = error.code;
+                console.warn(`[Vertex PayGo] Diagnostic log disabled (${error.code}); continuing without file logging.`);
+                return;
+            }
+            throw error;
+        }
         try {
             this.fs.fchmodSync?.(this.fileDescriptor, 0o600);
         } catch {
@@ -215,6 +230,7 @@ class LogStore {
     }
 
     read() {
+        if (this.disabled && this.fileDescriptor === undefined) return '';
         return this.fs.readFileSync(this.filePath, 'utf8');
     }
 

@@ -61,7 +61,7 @@ Vertex Flex 仅在 Gemini 网关模式可用，原生 OpenAI 模式拒绝 Flex�
 
 ### 固定端口
 
-首次启动会在 **ST/Luker 宿主根目录**创建 `st-vertex-paygo-bridge.json`：
+首次启动按以下优先级解析桥接配置目录并读写 `st-vertex-paygo-bridge.json`：`ST_VERTEX_PAYGO_DATA_DIR` → `<宿主 dataRoot>/vertex-paygo` → 宿主根目录（兼容自动读取旧根目录配置并在可写时迁移；只读目录下自动回退使用内存默认端口 `18443` 而不阻断启动）：
 
 ```json
 { "port": 18443 }
@@ -209,7 +209,7 @@ Google AI Studio 的 Standard 与 Flex 模式复用相同的预检机制、鉴�
 
 **数据恢复点**：插件启动、界面实际更新前及执行恢复前，会为有变化的用量账本和桥接配置保存本机快照，按宿主 `backups.common.numberOfBackups` 保留份数轮换。PayGo 面板中的“恢复数据”可选择当前用户的快照，确认后重启生效；恢复前保留原文件。快照包含当时的桥接开关与访问 key，应按敏感配置保管。它不是持续备份，不重复备份聊天、Google 凭据或日志；Luker 完整 ZIP 选择“设置”可带走快照，导回后再在 PayGo 中选择应用。限制、接口及失败恢复见[数据备份说明](docs/data-backups.md)。
 
-`GET /api/plugins/vertex-paygo/usage?chatId=...&limit=200&cursor=...` 只根据已认证用户自己的目录读取指定对话；`chatId` 本身不是访问凭据。每页默认 200 条、最多 500 条，存在后续页时返回 `nextCursor` 和 `truncated: true`。游标固定第一页看到的记录快照，因此翻页期间的新生成不会造成无限翻页。没有真实用户目录的匿名请求不能读取账本。
+`GET /api/plugins/vertex-paygo/usage?chatId=...&limit=200&cursor=...` 只根据已认证用户自己的目录读取指定对话；`chatId` 本身不是访问凭据。每页默认 200 条、最多 500 条，存在后续页时返回 `nextCursor` 和 `truncated: true`。此外支持 `GET /api/plugins/vertex-paygo/usage?chatId=...&ids=<id1>,<id2>,...` 按 `usageId` 批量直查（最多 50 个 ID，不可与 `cursor`/`limit` 混用），用于单楼费用精确对账。游标固定第一页看到的记录快照，因此翻页期间的新生成不会造成无限翻页。没有真实用户目录的匿名请求不能读取账本。
 
 记录状态为 `pending`、`complete`、`incomplete` 或 `failed`。只有捕获到有效 `usageMetadata` 才会标为 `complete`；缺失用量不会按 0 token 或 0 费用处理。新进程首次访问账本时会立即把上个进程遗留的 `pending` 记录持久化为 `incomplete`。非流响应使用增量 JSON 扫描，只保留顶层 `usageMetadata`；大型模型内容不会进入账本缓冲。单个超限 SSE 事件会被跳过，后续事件仍会继续检查。
 
@@ -219,10 +219,10 @@ Google AI Studio 的 Standard 与 Flex 模式复用相同的预检机制、鉴�
 
 Gemini 4（`gemini-4-neon`、`gemini-4-hydrogen`、`gemini-4-carbon`、`gemini-4-argon` 与 `gemini-4-argon-cyber-permissive`）通过插件原生接口生成时，也会在 ST/Luker 的服务端控制台输出类似宿主 Google 接口的调用信息：`Google AI Studio request:` 或 `Google Vertex AI request:`、非流式 `response:`，以及流式开始、完成、失败或取消状态。完成摘要包含耗时、结束原因与汇总用量；流式输出不逐帧打印或为日志缓存回复正文。请求与非流式响应正文使用 `console.debug`，可见性跟随宿主日志等级；**这些控制台正文包含提示词和模型输出**。仅打印转换后的 Gemini 正文，不打印认证头、代理地址或凭据；签名与续传 token 从控制台副本中移除。错误摘要只记录错误码等元数据，不打印原始异常。此行为不向下述诊断文件写入正文；更新服务端插件后需重启宿主生效。
 
-自 0.3.0 起，插件会在宿主根目录下维护统一的结构化诊断日志：
+自 0.3.0 起，插件维护统一的结构化诊断日志 `st-vertex-paygo.log`，目录按 `ST_VERTEX_PAYGO_LOG_DIR` → `ST_VERTEX_PAYGO_DATA_DIR` → `<宿主 dataRoot>/vertex-paygo` → 宿主根目录顺序解析；若目标目录只读或不可写，日志模块会降级为禁用并打印一次警告，不阻断插件初始化。
 
 ```text
-<SillyTavern 或 Luker 根目录>/st-vertex-paygo.log
+<ST_VERTEX_PAYGO_LOG_DIR | ST_VERTEX_PAYGO_DATA_DIR | 宿主 dataRoot/vertex-paygo | 宿主根目录>/st-vertex-paygo.log
 ```
 
 - **覆盖策略**：每次启动宿主或重新加载插件时自动覆写初始日志，不保留上一周期的旧内容（浏览器刷新不影响日志文件）。
@@ -299,6 +299,18 @@ Gemini 4（`gemini-4-neon`、`gemini-4-hydrogen`、`gemini-4-carbon`、`gemini-4
 三个接口都要求管理员会话，写操作另由宿主的 CSRF 中间件保护。`/health` 的 `capabilities.updater` 缺省表示后端版本过旧，`false` 表示当前会话不是管理员，`true` 表示面板可用。版本规则、事务与恢复边界见 [docs/in-app-updates.md](docs/in-app-updates.md)。
 
 宿主的 `enableServerPluginsAutoUpdate` 与 Luker 自带的扩展更新按钮是另外两条通道，本功能不修改它们；需要固定版本的用户应自行关闭宿主自动更新，否则宿主启动时可能把插件拉离配套 tag。
+
+---
+
+## 协议契约与第三方扩展协作
+
+面向第三方扩展与运维部署的完整协议规范见 [docs/protocol-and-extensions.md](docs/protocol-and-extensions.md)，涵盖：
+
+- 运行时目录环境变量（`ST_VERTEX_PAYGO_DATA_DIR`、`ST_VERTEX_PAYGO_LOG_DIR`、`<dataRoot>/vertex-paygo`）、旧配置迁移与只读降级；
+- `protocolVersion: 3` 契约：`/prepare`（含 AI Studio `base_url` 与取消释放语义）及 `GET /usage`（分页与 `?ids=` 批量直查）；
+- Native Gemini 4 签名信封（`st-vertex-paygo-tool:v1:`、`st-vertex-paygo-text:v1:`）与跨路由行为说明；
+- 流式请求响应头发送前（非 2xx JSON）与发送后（SSE `data: {"error": ...}`）的错误边界约定；
+- 前端 `window.STVertexPayGo`（`apiVersion: 1`）公开协作接口及多轮工具接力接入示例。
 
 ---
 
