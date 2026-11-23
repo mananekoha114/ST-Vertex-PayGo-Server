@@ -137,8 +137,14 @@ test('stream without reply text reports an exhausted output budget once', async 
     assert.equal(frames.at(-1).error.code,'GEMINI4_OUTPUT_BUDGET_EXHAUSTED');assert.deepEqual(frames.at(-1).error.details,{reason:'MAX_TOKENS'});
     const truncated=await runStream(sseHandler([{candidates:[{content:{parts:[{text:'partial'}]}}]},{candidates:[{finishReason:'MAX_TOKENS'}]}]));
     assert.equal(truncated.some(frame=>frame.error),false);
-    const blocked=await runStream(sseHandler([{promptFeedback:{blockReason:'PROHIBITED_CONTENT'}}]));
-    assert.equal(blocked.at(-1).error.code,'NATIVE_GEMINI_EMPTY_RESPONSE');assert.match(blocked.at(-1).error.message,/PROHIBITED_CONTENT/);
+    // Blocked before any visible or thought frame returns HTTP 502 JSON, not HTTP 200 SSE.
+    const blockedHeaders={};
+    const blockedRes=Object.assign(response(),{setHeader(name,value){blockedHeaders[name]=value;}});
+    await sseHandler([{promptFeedback:{blockReason:'PROHIBITED_CONTENT'}}])(request({...fixture,stream:true,...target}),blockedRes);
+    assert.equal(blockedRes.statusCode,502);
+    assert.equal(blockedHeaders['Content-Type'],undefined);
+    assert.equal(blockedRes.data.error.code,'NATIVE_GEMINI_EMPTY_RESPONSE');
+    assert.match(blockedRes.data.error.message,/PROHIBITED_CONTENT/);
 });
 test('stream keeps an upstream error event and ends a broken stream with an error event', async () => {
     const forwarded=await runStream(sseHandler([{candidates:[{content:{parts:[{thought:true,text:'thinking'}]}}]},{error:{code:'GEMINI4_UPSTREAM_HTTP_ERROR',message:'quota'}}]));
@@ -183,4 +189,106 @@ test('only Vertex Hydrogen and Neon ask Google to drop signatures bound to edite
     for (const model of ['gemini-4-carbon', 'gemini-4-argon', 'gemini-4-argon-cyber-permissive']) {
         assert.equal((await config(model, 'vertexai')).prefixMismatchBehavior, undefined);
     }
+});
+
+test('reasoning_effort off and none map to LOW and tool.function.strict is stripped', async () => {
+    for (const effort of ['off', 'OFF', 'none', 'None']) {
+        const body = await buildNativeGeminiBody({ ...fixture, reasoning_effort: effort }, runtime);
+        assert.equal(body.generationConfig.thinkingConfig.thinkingLevel, 'LOW');
+    }
+    const inputTools = [{
+        type: 'function',
+        function: {
+            name: 'lookup',
+            description: 'Lookup item',
+            strict: true,
+            parameters: { $schema: 'https://json-schema.org/draft/2020-12/schema', type: 'object', properties: { q: { type: 'string' } } },
+        },
+    }];
+    const body = await buildNativeGeminiBody({ ...fixture, tools: inputTools }, runtime);
+    assert.equal(Object.hasOwn(body.tools[0].function_declarations[0], 'strict'), false);
+    assert.equal(Object.hasOwn(body.tools[0].function_declarations[0].parameters, '$schema'), false);
+    assert.equal(inputTools[0].function.strict, true);
+});
+
+test('nonstream returns compatibility finish_reason, index, and normalized top-level usage', async () => {
+    const cases = [
+        {
+            data: {
+                candidates: [{ finishReason: 'STOP', content: { role: 'model', parts: [{ text: 'hello' }] } }],
+                usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 4, thoughtsTokenCount: 3, totalTokenCount: 17 },
+            },
+            finishReason: 'stop',
+            usage: { prompt_tokens: 10, completion_tokens: 7, total_tokens: 17 },
+        },
+        {
+            data: {
+                candidates: [{ finishReason: 'MAX_TOKENS', content: { role: 'model', parts: [{ text: 'cut' }] } }],
+                usageMetadata: { promptTokenCount: 5, candidatesTokenCount: 2, thoughtsTokenCount: 3 },
+            },
+            finishReason: 'length',
+            usage: { prompt_tokens: 5, completion_tokens: 5, total_tokens: 10 },
+        },
+        {
+            data: {
+                candidates: [{ finishReason: 'SAFETY', content: { role: 'model', parts: [{ text: 'partial' }] } }],
+            },
+            finishReason: 'content_filter',
+            usage: undefined,
+        },
+        {
+            data: {
+                candidates: [{ finishReason: 'STOP', content: { role: 'model', parts: [{ functionCall: { id: 'fn-1', name: 'tool', args: {} } }] } }],
+                usageMetadata: { promptTokenCount: 2, candidatesTokenCount: 1 },
+            },
+            finishReason: 'tool_calls',
+            usage: { prompt_tokens: 2, completion_tokens: 1, total_tokens: 3 },
+        },
+        {
+            data: {
+                candidates: [{ content: { role: 'model', parts: [{ text: 'no reason' }] } }],
+            },
+            finishReason: null,
+            usage: undefined,
+        },
+    ];
+    for (const item of cases) {
+        const handler = createNativeGeminiHandler({
+            runtime,
+            loopbackTransport: { baseUrl: 'http://127.0.0.1:1234' },
+            fetchImpl: async () => ({ ok: true, json: async () => structuredClone(item.data) }),
+        });
+        const res = response();
+        await handler(request({ ...fixture, ...target }), res);
+        assert.equal(res.statusCode, undefined);
+        assert.equal(res.data.choices[0].index, 0);
+        assert.equal(res.data.choices[0].finish_reason, item.finishReason);
+        assert.deepEqual(res.data.usage, item.usage);
+        assert.ok(Array.isArray(res.data.candidates));
+        assert.ok(res.data.responseContent);
+    }
+});
+
+test('pre-header streaming errors return HTTP 502 JSON without committing SSE headers', async () => {
+    const runPreHeaderError = async handler => {
+        const headers = {};
+        const res = Object.assign(response(), { setHeader(name, value) { headers[name] = value; } });
+        await handler(request({ ...fixture, stream: true, ...target }), res);
+        assert.equal(headers['Content-Type'], undefined);
+        assert.equal(res.statusCode, 502);
+        return res.data;
+    };
+
+    // 1. Upstream error on the very first SSE frame.
+    const firstError = await runPreHeaderError(sseHandler([{ error: { code: 'GEMINI4_UPSTREAM_HTTP_ERROR', message: 'quota exceeded' } }]));
+    assert.equal(firstError.error.code, 'GEMINI4_UPSTREAM_HTTP_ERROR');
+    assert.equal(firstError.error.message, 'quota exceeded');
+
+    // 2. Output budget exhausted with zero streamable frames.
+    const emptyBudget = await runPreHeaderError(sseHandler([{ candidates: [{ finishReason: 'MAX_TOKENS', content: { parts: [] } }] }]));
+    assert.equal(emptyBudget.error.code, 'GEMINI4_OUTPUT_BUDGET_EXHAUSTED');
+
+    // 3. Stream breaks before emitting any frame.
+    const earlyBreak = await runPreHeaderError(sseHandler([], { fail: new Error('socket reset') }));
+    assert.equal(earlyBreak.error.code, 'NATIVE_GEMINI_FAILED');
 });

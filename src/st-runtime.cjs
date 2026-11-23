@@ -245,7 +245,13 @@ async function loadStRuntime({
             throw new PluginError(400, 'GOOGLE_SECRET_MISSING', 'Google AI Studio API key is missing.');
         }
 
-        const config = await googleModule.getGoogleApiConfig(request, model, endpoint);
+        const customBaseUrl = typeof request?.body?.base_url === 'string' && request.body.base_url
+            ? request.body.base_url
+            : '';
+        const hostRequest = customBaseUrl
+            ? { ...request, body: { ...request.body, reverse_proxy: customBaseUrl, proxy_password: apiKey } }
+            : request;
+        const config = await googleModule.getGoogleApiConfig(hostRequest, model, endpoint);
         return {
             ...config,
             headers: { ...config.headers, 'x-goog-api-key': apiKey },

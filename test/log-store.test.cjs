@@ -253,3 +253,98 @@ test('low-priority prepare noise has its own bounded budget', () => {
         fs.rmSync(rootDir, { recursive: true, force: true });
     }
 });
+
+test('log store creates missing parent directories before opening the log file', () => {
+    const baseDir = makeTemporaryRoot();
+    const nestedRoot = path.join(baseDir, 'nested', 'vertex-paygo');
+    const store = new LogStore({ rootDir: nestedRoot });
+    try {
+        assert.equal(fs.statSync(nestedRoot).isDirectory(), true);
+        assert.equal(store.server('info', 'nested_started'), true);
+        assert.match(store.read(), /nested_started/u);
+    } finally {
+        store.close();
+        fs.rmSync(baseDir, { recursive: true, force: true });
+    }
+});
+
+test('log store keeps throwing by default when filesystem is read-only', () => {
+    const rootDir = path.resolve(os.tmpdir(), 'vertex-paygo-ro-default');
+    const roFs = {
+        mkdirSync() {},
+        openSync() {
+            const error = new Error('read-only filesystem');
+            error.code = 'EROFS';
+            throw error;
+        },
+    };
+
+    assert.throws(() => new LogStore({ rootDir, fsModule: roFs }), { code: 'EROFS' });
+});
+
+test('log store degrades cleanly with allowReadOnlyFallback on EROFS/EACCES/EPERM/ENOENT', t => {
+    const rootDir = path.resolve(os.tmpdir(), 'vertex-paygo-ro-fallback');
+    const warnings = [];
+    t.mock.method(console, 'warn', message => warnings.push(message));
+
+    for (const code of ['EROFS', 'EACCES', 'EPERM', 'ENOENT']) {
+        warnings.length = 0;
+        let readFileCalled = false;
+        const failingFs = {
+            mkdirSync() {},
+            openSync() {
+                const error = new Error(`open failed: ${code}`);
+                error.code = code;
+                throw error;
+            },
+            readFileSync() {
+                readFileCalled = true;
+                throw new Error('readFileSync must not be called while degraded');
+            },
+        };
+
+        const store = new LogStore({ rootDir, fsModule: failingFs, allowReadOnlyFallback: true });
+        assert.equal(store.disabled, true);
+        assert.equal(store.fileDescriptor, undefined);
+        assert.equal(store.degradedReason, code);
+        assert.equal(warnings.length, 1);
+        assert.match(warnings[0], new RegExp(code, 'u'));
+        assert.equal(store.server('info', 'ignored_event'), false);
+        assert.equal(store.client('warn', 'ignored_client_event'), false);
+        assert.equal(store.read(), '');
+        assert.equal(readFileCalled, false);
+        store.close();
+    }
+
+    // mkdirSync failure also degrades without calling openSync
+    warnings.length = 0;
+    let openCalled = false;
+    const mkdirFailingFs = {
+        mkdirSync() {
+            const error = new Error('cannot create directory');
+            error.code = 'EROFS';
+            throw error;
+        },
+        openSync() {
+            openCalled = true;
+            return 1;
+        },
+    };
+    const degradedByMkdir = new LogStore({ rootDir, fsModule: mkdirFailingFs, allowReadOnlyFallback: true });
+    assert.equal(openCalled, false);
+    assert.equal(degradedByMkdir.disabled, true);
+    assert.equal(degradedByMkdir.degradedReason, 'EROFS');
+    assert.equal(degradedByMkdir.read(), '');
+    assert.equal(warnings.length, 1);
+
+    // Non-read-only errors still throw even with allowReadOnlyFallback enabled
+    const ioErrorFs = {
+        mkdirSync() {},
+        openSync() {
+            const error = new Error('hardware I/O error');
+            error.code = 'EIO';
+            throw error;
+        },
+    };
+    assert.throws(() => new LogStore({ rootDir, fsModule: ioErrorFs, allowReadOnlyFallback: true }), { code: 'EIO' });
+});

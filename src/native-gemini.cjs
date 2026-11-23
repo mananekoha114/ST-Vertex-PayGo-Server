@@ -47,6 +47,7 @@ function unpackTextSignature(value) {
 }
 const isVisiblePart = part => !part.thought && ((typeof part.text === 'string' && part.text.trim().length > 0)
     || Boolean(part.functionCall || part.inlineData || part.executableCode || part.codeExecutionResult));
+const hasStreamablePart = part => isVisiblePart(part) || (Boolean(part.thought) && typeof part.text === 'string' && part.text.length > 0);
 // A terminal response without reply text otherwise reaches the host as an
 // empty message. Thinking tokens share maxOutputTokens with the reply.
 function noVisibleOutput(reason) {
@@ -147,7 +148,7 @@ async function buildNativeGeminiBody(input, runtime) {
     });
     if (input.continue_prefill || prompt.contents.at(-1)?.role === 'model') prompt.contents.push({ role: 'user', parts: [{ text: 'Continue the previous assistant response from where it stopped, without repeating previous content.' }] });
     const thinkingConfig = { includeThoughts: Boolean(input.include_reasoning) };
-    const level = { min: 'LOW', minimal: 'LOW', low: 'LOW', medium: 'MEDIUM', high: 'HIGH', max: maxThinkingLevel(input.model) }[String(input.reasoning_effort).toLowerCase()];
+    const level = { off: 'LOW', none: 'LOW', min: 'LOW', minimal: 'LOW', low: 'LOW', medium: 'MEDIUM', high: 'HIGH', max: maxThinkingLevel(input.model) }[String(input.reasoning_effort).toLowerCase()];
     if (level) thinkingConfig.thinkingLevel = level;
     // Lorebook entries, macros and message edits change earlier context between turns.
     if (dropsMismatchedSignatures(input.model, input.chat_completion_source)) thinkingConfig.prefixMismatchBehavior = 'DROP';
@@ -161,6 +162,7 @@ async function buildNativeGeminiBody(input, runtime) {
     const declarations = [], custom = [];
     for (const tool of structuredClone(input.tools ?? [])) {
         if (tool.type === 'function' && tool.function) {
+            delete tool.function.strict;
             if (tool.function.parameters) { delete tool.function.parameters.$schema; if (tool.function.parameters.properties && !Object.keys(tool.function.parameters.properties).length) delete tool.function.parameters; }
             declarations.push(tool.function);
         } else if (tool[tool.type]) custom.push({ [tool.type]: tool[tool.type] });
@@ -202,7 +204,8 @@ function requestLoopback(url, { method, headers, body, signal, timeoutMs = 31 * 
 }
 function createNativeGeminiHandler({ runtime, loopbackTransport, fetchImpl = requestLoopback, upstreamTimeoutMs = 31 * 60 * 1000, logger = console }) {
     return async (request, response) => {
-        let streaming = false;
+        let streamStarted = false;
+        const hasHeadersSent = () => streamStarted || Boolean(response.headersSent);
         const started = Date.now();
         const apiName = request.body?.chat_completion_source === 'vertexai' ? 'Google Vertex AI' : 'Google AI Studio';
         const log = (level, event, details) => {
@@ -236,34 +239,58 @@ function createNativeGeminiHandler({ runtime, loopbackTransport, fetchImpl = req
             const upstream = await fetchImpl(url, { method: 'POST', headers, body: JSON.stringify(body), signal: controller.signal, redirect: 'error', timeoutMs: upstreamTimeoutMs });
             if (!upstream.ok) throw await readLoopbackFailure(upstream);
             if (input.stream) {
-                // ST mounts compression() globally and it compresses text/event-stream:
-                // without no-transform every frame is held until generation ends.
-                response.setHeader('Cache-Control', 'no-store, no-transform');
-                // Same for nginx-style reverse proxies in front of the host.
-                response.setHeader('X-Accel-Buffering', 'no');
-                response.setHeader('Content-Type', 'text/event-stream');
+                const ensureSseHeaders = () => {
+                    if (streamStarted) return;
+                    // ST mounts compression() globally and it compresses text/event-stream:
+                    // without no-transform every frame is held until generation ends.
+                    response.setHeader('Cache-Control', 'no-store, no-transform');
+                    // Same for nginx-style reverse proxies in front of the host.
+                    response.setHeader('X-Accel-Buffering', 'no');
+                    response.setHeader('Content-Type', 'text/event-stream');
+                    streamStarted = true;
+                };
+                const flushFrame = async text => {
+                    ensureSseHeaders();
+                    await writeResponse(response, text);
+                };
                 let buffer = '';
                 const maxEventCharacters = 32 * 1024 * 1024;
                 const tooLarge = () => new PluginError(502, 'NATIVE_GEMINI_INVALID_RESPONSE', 'Native Gemini returned a stream event that is too large.');
                 const decoder = new TextDecoder();
                 const state = { textParts: [], visible: false, errored: false, reason: undefined };
-                streaming = true;
+                const pendingFrames = [];
+                let pendingChars = 0;
+                const emitFrame = async frame => {
+                    const transformed = transformFrame(frame, state, { headersSent: hasHeadersSent() });
+                    if (hasHeadersSent() || transformed.streamable) {
+                        while (pendingFrames.length) await flushFrame(pendingFrames.shift());
+                        pendingChars = 0;
+                        await flushFrame(transformed.text);
+                    } else {
+                        pendingChars += transformed.text.length;
+                        if (pendingChars > maxEventCharacters) throw tooLarge();
+                        pendingFrames.push(transformed.text);
+                    }
+                };
                 log('info', 'streaming request in progress:', { model: input.model });
                 for await (const chunk of Readable.fromWeb(upstream.body)) {
                     controller.signal.throwIfAborted();
                     buffer += decoder.decode(chunk, { stream: true });
                     const frames = buffer.split(/\r?\n\r?\n/u); buffer = frames.pop();
                     if (buffer.length > maxEventCharacters || frames.some(frame => frame.length > maxEventCharacters)) throw tooLarge();
-                    for (const frame of frames) await writeResponse(response, transformFrame(frame, state));
+                    for (const frame of frames) await emitFrame(frame);
                 }
                 buffer += decoder.decode();
                 if (buffer.length > maxEventCharacters) throw tooLarge();
-                if (buffer) await writeResponse(response, transformFrame(buffer, state));
+                if (buffer) await emitFrame(buffer);
                 if (state.reason && !state.visible && !state.errored) {
                     const failure = noVisibleOutput(state.reason);
+                    if (!hasHeadersSent()) throw failure;
                     state.errored = true;
                     state.failureCode = failure.code;
-                    await writeResponse(response, errorFrame(failure));
+                    await flushFrame(errorFrame(failure));
+                } else if (pendingFrames.length) {
+                    while (pendingFrames.length) await flushFrame(pendingFrames.shift());
                 }
                 response.end();
                 if (state.errored) log('warn', 'request failed:', { code: state.failureCode, elapsedMs: Date.now() - started });
@@ -273,49 +300,91 @@ function createNativeGeminiHandler({ runtime, loopbackTransport, fetchImpl = req
                 const data = await upstream.json();
                 log('debug', 'response:', data);
                 wrapToolMetadata(data);
-                const content = data.candidates?.[0]?.content;
-                if (!(content?.parts ?? []).some(isVisiblePart)) throw noVisibleOutput(data.promptFeedback?.blockReason ?? data.candidates?.[0]?.finishReason);
+                const candidate = data.candidates?.[0];
+                const content = candidate?.content;
+                if (!(content?.parts ?? []).some(isVisiblePart)) throw noVisibleOutput(data.promptFeedback?.blockReason ?? candidate?.finishReason);
                 const nativeGeminiSignature = packTextSignature(collectTextParts(content.parts));
                 if (nativeGeminiSignature) content.parts.push({ text: '', thoughtSignature: nativeGeminiSignature });
-                response.json({ ...data, nativeGeminiSignature, choices: [{ message: { content: (content?.parts ?? []).filter(part => !part.thought && typeof part.text === 'string').map(part => part.text).join('') } }], responseContent: content });
-                completed({ model: input.model, stream: false, finishReason: data.candidates?.[0]?.finishReason, usageMetadata: sanitizeUsage(data.usageMetadata) });
+                const finishReason = candidate?.finishReason;
+                const hasFunctionCall = (content?.parts ?? []).some(part => Boolean(part.functionCall));
+                const mappedFinishReason = hasFunctionCall
+                    ? 'tool_calls'
+                    : finishReason === 'STOP'
+                        ? 'stop'
+                        : finishReason === 'MAX_TOKENS'
+                            ? 'length'
+                            : ['SAFETY', 'RECITATION', 'BLOCKLIST', 'PROHIBITED_CONTENT', 'SPII', 'IMAGE_SAFETY'].includes(finishReason)
+                                ? 'content_filter'
+                                : null;
+                const sanitizedUsage = sanitizeUsage(data.usageMetadata);
+                const usage = sanitizedUsage
+                    ? {
+                        prompt_tokens: sanitizedUsage.promptTokenCount ?? 0,
+                        completion_tokens: (sanitizedUsage.candidatesTokenCount ?? 0) + (sanitizedUsage.thoughtsTokenCount ?? 0),
+                        total_tokens: sanitizedUsage.totalTokenCount
+                            ?? ((sanitizedUsage.promptTokenCount ?? 0) + (sanitizedUsage.candidatesTokenCount ?? 0) + (sanitizedUsage.thoughtsTokenCount ?? 0)),
+                    }
+                    : undefined;
+                response.json({
+                    ...data,
+                    nativeGeminiSignature,
+                    ...(usage ? { usage } : {}),
+                    choices: [{
+                        index: 0,
+                        message: { content: (content?.parts ?? []).filter(part => !part.thought && typeof part.text === 'string').map(part => part.text).join('') },
+                        finish_reason: mappedFinishReason,
+                    }],
+                    responseContent: content,
+                });
+                completed({ model: input.model, stream: false, finishReason, usageMetadata: sanitizedUsage });
             }
         } catch (error) {
             const failure = error instanceof PluginError ? error : new PluginError(502, 'NATIVE_GEMINI_FAILED', 'Native Gemini generation could not be completed.');
             if (controller.signal.aborted) log('info', 'request cancelled:', { elapsedMs: Date.now() - started });
             else log('warn', 'request failed:', { code: failure.code, status: failure.status, elapsedMs: Date.now() - started });
-            if (controller.signal.aborted || response.writableEnded) { if (streaming && !response.writableEnded) response.destroy?.(); }
-            else if (streaming || response.headersSent) {
+            if (controller.signal.aborted || response.writableEnded) { if (streamStarted && !response.writableEnded) response.destroy?.(); }
+            else if (hasHeadersSent()) {
                 // SSE status is already committed; end with an event the host shows.
                 try { await writeResponse(response, errorFrame(failure)); response.end(); } catch { response.destroy(); }
             } else response.status(failure.status).json(hostErrorBody(failure));
         } finally { request.removeListener('aborted', abort); response.removeListener('close', close); }
     };
 }
-function transformFrame(frame, state) {
+function transformFrame(frame, state, { headersSent = false } = {}) {
     const lines = frame.split(/\r?\n/u), data = lines.filter(line => line.startsWith('data:')).map(line => line.slice(5).trimStart()).join('\n');
-    if (!data || data === '[DONE]') return frame + '\n\n';
+    if (!data || data === '[DONE]') return { text: frame + '\n\n', streamable: false };
+    let parsed;
     try {
-        const parsed = wrapToolMetadata(JSON.parse(data));
-        if (parsed.error) {
-            state.errored = true;
-            state.failureCode = typeof parsed.error.code === 'string' && /^[A-Z0-9_]{1,80}$/u.test(parsed.error.code)
-                ? parsed.error.code : 'NATIVE_GEMINI_UPSTREAM_FAILED';
-        }
-        if (parsed.usageMetadata) state.usage = sanitizeUsage(parsed.usageMetadata);
-        if (typeof parsed.promptFeedback?.blockReason === 'string') state.reason = parsed.promptFeedback.blockReason;
-        const candidate = parsed.candidates?.[0];
-        if (candidate) {
-            const parts = candidate.content?.parts ?? [];
-            if (parts.some(isVisiblePart)) state.visible = true;
-            state.textParts.push(...collectTextParts(parts));
-            if (candidate.finishReason) {
-                state.reason = candidate.finishReason;
-                const signature = packTextSignature(state.textParts);
-                if (signature) { candidate.content ??= { role: 'model', parts: [] }; candidate.content.parts ??= []; candidate.content.parts.push({ text: '', thoughtSignature: signature }); }
-            }
-        }
-        return lines.filter(line => !line.startsWith('data:')).concat(`data: ${JSON.stringify(parsed)}`).join('\n') + '\n\n';
+        parsed = wrapToolMetadata(JSON.parse(data));
     } catch { throw new PluginError(502, 'NATIVE_GEMINI_INVALID_RESPONSE', 'Native Gemini returned an invalid stream.'); }
+    if (parsed.error) {
+        state.errored = true;
+        state.failureCode = typeof parsed.error.code === 'string' && /^[A-Z0-9_]{1,80}$/u.test(parsed.error.code)
+            ? parsed.error.code : 'NATIVE_GEMINI_UPSTREAM_FAILED';
+        if (!headersSent) {
+            const message = typeof parsed.error.message === 'string' && parsed.error.message
+                ? parsed.error.message.slice(0, 1000) : 'Native Gemini generation failed.';
+            throw new PluginError(502, state.failureCode, message);
+        }
+    }
+    if (parsed.usageMetadata) state.usage = sanitizeUsage(parsed.usageMetadata);
+    if (typeof parsed.promptFeedback?.blockReason === 'string') state.reason = parsed.promptFeedback.blockReason;
+    let streamable = false;
+    const candidate = parsed.candidates?.[0];
+    if (candidate) {
+        const parts = candidate.content?.parts ?? [];
+        if (parts.some(isVisiblePart)) state.visible = true;
+        if (parts.some(hasStreamablePart)) streamable = true;
+        state.textParts.push(...collectTextParts(parts));
+        if (candidate.finishReason) {
+            state.reason = candidate.finishReason;
+            const signature = packTextSignature(state.textParts);
+            if (signature) { candidate.content ??= { role: 'model', parts: [] }; candidate.content.parts ??= []; candidate.content.parts.push({ text: '', thoughtSignature: signature }); }
+        }
+    }
+    return {
+        text: lines.filter(line => !line.startsWith('data:')).concat(`data: ${JSON.stringify(parsed)}`).join('\n') + '\n\n',
+        streamable,
+    };
 }
 module.exports = { createNativeGeminiHandler, buildNativeGeminiBody, wrapToolMetadata, unpackToolSignature, requestLoopback, unpackTextSignature, packTextSignature };

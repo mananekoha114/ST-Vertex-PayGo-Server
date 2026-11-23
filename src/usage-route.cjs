@@ -1,7 +1,7 @@
 'use strict';
 
 const { PluginError, sendExpressError } = require('./errors.cjs');
-const { validateChatId } = require('./protocol.cjs');
+const { validateChatId, validateUsageIds } = require('./protocol.cjs');
 
 function createUsageHandler({ usageStore }) {
     return function usageHandler(request, response) {
@@ -11,6 +11,15 @@ function createUsageHandler({ usageStore }) {
             }
             const chatId = validateChatId(request.query?.chatId);
             response.set?.('Cache-Control', 'no-store');
+            if (request.query?.ids !== undefined) {
+                if (request.query?.cursor !== undefined || request.query?.limit !== undefined) {
+                    throw new PluginError(400, 'INVALID_USAGE_PAGE', 'ids cannot be combined with cursor or limit.');
+                }
+                const ids = validateUsageIds(request.query.ids);
+                const result = usageStore.getByIds(request.user, chatId, ids);
+                if (!result) throw new PluginError(400, 'INVALID_USAGE_IDS', 'Invalid usage IDs.');
+                return response.json({ ok: true, ...result });
+            }
             const page = usageStore.list(request.user, chatId, {
                 cursor: request.query?.cursor,
                 limit: request.query?.limit,

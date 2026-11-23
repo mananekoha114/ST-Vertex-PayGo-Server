@@ -141,6 +141,19 @@ class UsageStore {
             ...(truncated ? { nextCursor: encodeCursor(nextOffset, snapshot), truncated: true } : {}),
         };
     }
+
+    getByIds(user, chatId, ids) {
+        const file = ledgerPathForUser(user);
+        if (!file) return null;
+        this.#recover(file, this.#read(file));
+        const index = this.indexes.get(file);
+        const matched = [];
+        for (const id of ids) {
+            const record = index?.get(id);
+            if (record && record.chatId === chatId) matched.push(record);
+        }
+        return { records: clone(matched), truncated: false };
+    }
 }
 
 module.exports = { STORE_DIRECTORY, STORE_FILE, UsageStore, ledgerPathForUser };

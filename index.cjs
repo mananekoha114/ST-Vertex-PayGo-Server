@@ -21,6 +21,7 @@ const { loadStRuntime } = require('./src/st-runtime.cjs');
 const { TicketStore } = require('./src/ticket-store.cjs');
 const { UsageStore } = require('./src/usage-store.cjs');
 const { createDataBackups } = require('./src/data-backups.cjs');
+const { resolveRuntimePaths } = require('./src/runtime-paths.cjs');
 
 const info = Object.freeze({
     id: PLUGIN_ID,
@@ -33,7 +34,8 @@ let activeState;
 async function init(router) {
     if (activeState) throw new Error('Vertex PayGo server plugin is already initialized.');
 
-    const logStore = new LogStore({ rootDir: process.cwd() });
+    const paths = resolveRuntimePaths();
+    const logStore = new LogStore({ rootDir: paths.logDir, allowReadOnlyFallback: true });
     logStore.server('info', 'plugin_initializing');
     let stRuntime;
     let ticketStore;
@@ -63,7 +65,7 @@ async function init(router) {
         });
         await loopbackTransport.start();
         try {
-            const port = await readBridgePort();
+            const port = await readBridgePort(paths.configDir, { legacyRootDir: paths.legacyRootDir });
             bridgeListener = createBridgeListener({ openaiBridge, port });
             await bridgeListener.start();
             logStore.server('info', 'bridge_listener_started', { port });

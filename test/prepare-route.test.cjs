@@ -372,3 +372,104 @@ test('downstream Vertex HTTP 401 evicts the ticket OAuth cache key without expos
         ticketStore.close();
     }
 });
+
+test('prepare forwards makersuite base_url while requiring authenticated credentials and extracting proxyKey', async () => {
+    const ticketStore = new TicketStore();
+    const calls = [];
+    try {
+        const handler = createPrepareHandler({
+            stRuntime: {
+                async getGoogleApiConfig(request, model, endpoint) {
+                    calls.push(request.body);
+                    return {
+                        url: `${request.body.base_url}/v1beta/models/${model}:${endpoint}`,
+                        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': 'makersuite-secret-key' },
+                    };
+                },
+            },
+            ticketStore,
+            loopbackTransport: { baseUrl: 'http://127.0.0.1:54321' },
+        });
+        const response = makeResponse();
+        await handler({
+            body: makeBody({
+                chat_completion_source: 'makersuite',
+                model: 'Gemini-2.5-Pro',
+                tier: 'standard',
+                paygoOnly: false,
+                stream: false,
+                base_url: 'https://custom.example/api///',
+            }),
+            user: { directories: { root: 'test-user' } },
+        }, response);
+
+        assert.equal(response.statusCode, 200);
+        assert.deepEqual(calls, [{ api: 'makersuite', base_url: 'https://custom.example/api' }]);
+        const ticket = ticketStore.consume(response.body.ticket, response.body.proxySecret);
+        assert.equal(ticket.targetUrl, 'https://custom.example/api/v1beta/models/Gemini-2.5-Pro:generateContent');
+        assert.equal(ticket.reverseProxy, 'https://custom.example/api');
+        assert.equal(ticket.proxyKey, 'makersuite-secret-key');
+        assert.equal(ticket.headers['x-goog-api-key'], undefined);
+
+        // base_url must NOT allow unauthenticated upstream headers.
+        const unauthHandler = createPrepareHandler({
+            stRuntime: {
+                async getGoogleApiConfig(request, model, endpoint) {
+                    return {
+                        url: `${request.body.base_url}/v1beta/models/${model}:${endpoint}`,
+                        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': '' },
+                    };
+                },
+            },
+            ticketStore,
+            loopbackTransport: { baseUrl: 'http://127.0.0.1:54321' },
+        });
+        const unauthRes = makeResponse();
+        await unauthHandler({
+            body: makeBody({
+                chat_completion_source: 'makersuite',
+                tier: 'standard',
+                paygoOnly: false,
+                stream: false,
+                base_url: 'https://custom.example/api',
+            }),
+            user: { directories: { root: 'test-user' } },
+        }, unauthRes);
+        assert.equal(unauthRes.statusCode, 500);
+        assert.equal(unauthRes.body.code, 'UNSAFE_GOOGLE_HEADERS');
+    } finally {
+        ticketStore.close();
+    }
+});
+
+test('prepare abort releases reservation and does not create an orphan usage record', async () => {
+    const ticketStore = new TicketStore();
+    let usageCreates = 0;
+    try {
+        const handler = createPrepareHandler({
+            stRuntime: {
+                async getGoogleApiConfig(_request, model, endpoint) {
+                    return {
+                        url: `https://aiplatform.googleapis.com/v1/publishers/google/models/${model}:${endpoint}`,
+                        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': 'private' },
+                    };
+                },
+            },
+            ticketStore,
+            usageStore: { create() { usageCreates += 1; return { file: 'x', id: 'orphan' }; } },
+            loopbackTransport: { baseUrl: 'http://127.0.0.1:1' },
+        });
+        const response = makeResponse();
+        await handler({
+            body: makeBody({ usageChatId: 'chat-aborted' }),
+            user: { directories: { root: 'test-user' } },
+            aborted: true,
+        }, response);
+        assert.equal(ticketStore.size, 0);
+        assert.equal(ticketStore.pendingSize, 0);
+        assert.equal(usageCreates, 0);
+        assert.equal(response.body, undefined);
+    } finally {
+        ticketStore.close();
+    }
+});
