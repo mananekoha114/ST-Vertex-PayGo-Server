@@ -16,6 +16,7 @@ const { PLUGIN_ID, PROTOCOL_VERSION, validatePreparePayload } = require('./proto
 const { prepareGoogleHeaders, prepareGoogleTarget } = require('./target-policy.cjs');
 const { takeProxyKey } = require('./upstream-proxy.cjs');
 const { GEMINI4_MODELS } = require('./gemini4-models.cjs');
+const { VERTEX_MULTI_REGIONS } = require('./vertex-regions.cjs');
 const EXPLICIT_SECRET_ERROR_CODES = new Set([
     'EXPLICIT_SECRET_UNSUPPORTED',
     'EXPLICIT_SECRET_NOT_FOUND',
@@ -171,6 +172,7 @@ function createPrepareHandler({ stRuntime, ticketStore, loopbackTransport, logSt
                 transport: 'loopback-http',
                 nativeGemini4: true,
                 nativeGemini4Models: [...GEMINI4_MODELS],
+                vertexMultiRegions: [...VERTEX_MULTI_REGIONS],
                 // A prepared Vertex target is always v1, with or without a proxy
                 // base; the native route rewrites Gemini 4 to v1beta1 itself.
                 nativeGeminiApiVersion: config.source === 'makersuite'

@@ -212,7 +212,7 @@ test('route registration exposes handshake, prepare, and fail-closed sink', () =
     assert.equal(response.body.transport, 'loopback-http');
     assert.equal(response.body.pluginVersion, '0.6.1');
     assert.equal(response.body.sillyTavern.compatibleRange, '>=1.16.0');
-    assert.deepEqual(response.body.capabilities, { logs: true, clientLogging: true, usage: true, nativeGemini4: true, dataBackups: false, updater: false, openaiBridge: false, openaiBridgeDebug: false, openaiBridgeLogs: false, openaiBridgeGateway: false, openaiBridgePersistence: false });
+    assert.deepEqual(response.body.capabilities, { logs: true, clientLogging: true, usage: true, nativeGemini4: true, vertexMultiRegions: ['us', 'eu'], dataBackups: false, updater: false, openaiBridge: false, openaiBridgeDebug: false, openaiBridgeLogs: false, openaiBridgeGateway: false, openaiBridgePersistence: false });
     assert.equal(Object.hasOwn(response.body, 'port'), false);
     assert.deepEqual(logEvents, []);
 
@@ -349,6 +349,7 @@ test('data backup routes and capability are installed together', () => {
     const response = { set() {}, json(body) { this.body = body; } };
     routes.get[0][1]({ user: {} }, response);
     assert.equal(response.body.capabilities.dataBackups, true);
+    assert.deepEqual(response.body.capabilities.vertexMultiRegions, ['us', 'eu']);
 });
 
 test('missing active secrets fail with specific 400 codes and explicit secret_id infers Express vs Full without cross-mode bleed on implicit requests', async () => {
@@ -432,6 +433,37 @@ test('missing active secrets fail with specific 400 codes and explicit secret_id
         user,
     }, 'gemini-2.5-flash', 'generateContent');
     assert.equal(inferredExpress.headers['x-goog-api-key'], 'express-api-key-value');
+
+    // Multi-regions (us, eu) build REP endpoints on Full/inferred-Full and reject Express before or after secret_id inference.
+    for (const region of ['us', 'eu']) {
+        await assert.rejects(
+            runtime.getGoogleApiConfig({ body: { api: 'vertexai', vertexai_auth_mode: 'express', vertexai_region: region }, user }, 'gemini-3.8-flash', 'generateContent'),
+            { status: 400, code: 'VERTEX_MULTI_REGION_REQUIRES_FULL_AUTH', details: { authMode: 'express', region } },
+        );
+        await assert.rejects(
+            runtime.getGoogleApiConfig({ body: { api: 'vertexai', secret_id: 'express-uuid', vertexai_auth_mode: 'full', vertexai_region: region }, user }, 'gemini-3.8-flash', 'generateContent'),
+            { status: 400, code: 'VERTEX_MULTI_REGION_REQUIRES_FULL_AUTH', details: { authMode: 'express', region } },
+        );
+        const multiFull = await runtime.getGoogleApiConfig({
+            body: { api: 'vertexai', secret_id: 'sa-uuid', vertexai_auth_mode: 'express', vertexai_region: region },
+            user,
+        }, 'gemini-4-hydrogen', 'generateContent');
+        assert.equal(
+            multiFull.url,
+            `https://aiplatform.${region}.rep.googleapis.com/v1/projects/profile-project/locations/${region}/publishers/google/models/gemini-4-hydrogen:generateContent`,
+        );
+        for (const authenticate of [false, true]) {
+            const oai = await runtime.getOpenAIConfig(
+                { user },
+                { source: 'vertexai', model: 'gemini-3.8-flash', authMode: 'full', region, secretId: 'sa-uuid' },
+                authenticate,
+            );
+            assert.equal(
+                oai.target,
+                `https://aiplatform.${region}.rep.googleapis.com/v1/projects/profile-project/locations/${region}/endpoints/openapi/chat/completions`,
+            );
+        }
+    }
 
     runtime.clearOAuthCache();
     const afterClear = await runtime.getGoogleApiConfig({

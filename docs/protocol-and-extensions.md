@@ -28,7 +28,7 @@ Breaking wire changes increment `protocolVersion`. Additive optional request fie
 
 ### 2.1 `GET /api/plugins/vertex-paygo/health`
 
-Returns server readiness, `protocolVersion: 3`, `transport: "loopback-http"`, and feature capability flags (such as `capabilities.updater`, `capabilities.dataBackups`, etc.).
+Returns server readiness, `protocolVersion: 3`, `transport: "loopback-http"`, and feature capability flags (including `capabilities.vertexMultiRegions: ["us", "eu"]`, `capabilities.nativeGemini4`, `capabilities.updater`, `capabilities.dataBackups`, and OpenAI bridge flags).
 
 ### 2.2 `POST /api/plugins/vertex-paygo/prepare`
 
@@ -38,6 +38,8 @@ Issues a single-use, 5-minute loopback proxy ticket bound to the authenticated h
 
 - Required core fields: `protocolVersion` (`3`), `chat_completion_source` (`"vertexai" | "makersuite"`), `model`, `stream`, `tier` (`"standard" | "flex" | "priority"`), `paygoOnly` (`boolean`, Vertex AI only).
 - Vertex AI fields (when `chat_completion_source === "vertexai"`): `vertexai_auth_mode`, `vertexai_region`, `vertexai_express_project_id`.
+  - **Upstream endpoint routing**: `global` targets `https://aiplatform.googleapis.com`; multi-regions `us` and `eu` target Google's Representative Endpoints `https://aiplatform.{us|eu}.rep.googleapis.com` with `/projects/{project}/locations/{us|eu}/...` (`v1`, rewritten to `v1beta1` for Gemini 4); single regions target `https://{region}-aiplatform.googleapis.com`.
+  - **Multi-region authentication policy**: Official (`!reverse_proxy`) `us` and `eu` endpoints require Full service-account authentication (`vertexai_auth_mode === "full"`). Express API-key requests on `us` / `eu` are rejected with `400 VERTEX_MULTI_REGION_REQUIRES_FULL_AUTH` (`details: { authMode: "express", region }`); when an explicit `secret_id` is supplied (e.g., Connection Manager profiles that omit `vertexai_auth_mode`), the server inspects the host secret bucket first and allows service-account credentials while rejecting Express keys. Flex and Priority still fail first with `409 GLOBAL_REGION_REQUIRED` on any non-`global` region.
 - Optional host credential selector: `secret_id`.
 - Optional upstream routing overrides:
   - `reverse_proxy` (+ `proxy_password`): Standard SillyTavern reverse-proxy mode. Credentials come from `proxy_password` (or host proxy behavior) rather than Google official secrets.
@@ -55,9 +57,12 @@ Issues a single-use, 5-minute loopback proxy ticket bound to the authenticated h
   "usageId": "<usage-record-id-or-null>",
   "nativeGemini4": true,
   "nativeGemini4Models": ["gemini-4-neon", "gemini-4-hydrogen", "gemini-4-carbon", "gemini-4-argon", "gemini-4-argon-cyber-permissive"],
+  "vertexMultiRegions": ["us", "eu"],
   "nativeGeminiApiVersion": "v1beta"
 }
 ```
+
+- **Multi-region capability check (`vertexMultiRegions`)**: Frontends and `window.STVertexPayGo.prepareTicket()` inspect `prepared.vertexMultiRegions` when preparing an official (`!reverse_proxy`) Vertex `us` or `eu` request. If talking to an older `protocolVersion: 3` server that predates `vertexMultiRegions`, the client fails closed before forwarding (`MULTI_REGION_SERVER_UPGRADE_REQUIRED`) instead of letting the old server connect to non-existent `{us|eu}-aiplatform.googleapis.com`.
 
 **Cancellation & abort semantics**:
 
@@ -181,7 +186,7 @@ window.addEventListener('st-vertex-paygo:ready', (event) => {
 | `getStatus()` | `() => Readonly<{ ready, apiVersion, mode, clientVersion, protocolVersion, state }>` | Returns current readiness, runtime mode (`'server' \| 'tauri'`), versions, and normalized UI state `{ version, tier, paygoOnly }`. |
 | `inspectRoute(generateData)` | `(data?) => Readonly<{ isGoogleSource, requiresPlugin, isNativeGemini4, source, model, tier, paygoOnly, originalReverseProxy, originalBaseUrl, usageChatId }>` | Pure read-only route inspector. Safely unwraps PayGo's internal failure sink without exposing any credentials or requiring access to private request keys. |
 | `onPrepare(listener)` | `(fn) => unsubscribe` | Subscribes to redacted preparation events `{ usageId, usageChatId, source, model, tier, paygoOnly, stream, nativeGemini4, nativeGeminiApiVersion, background }`. Returns an unsubscribe function. |
-| `prepareTicket(generateData, options?)` | `async (data, { signal?, state?, chatId?, background = true }?) => Readonly<{ ticket, proxyUrl, proxySecret, usageId, usageChatId, nativeGemini4, nativeGeminiApiVersion, tier, paygoOnly, price }>` | **Server mode only** (throws `code: 'UNSUPPORTED_MODE'` in Tauri mode). Validates state/model/region against active policy, requests a single-use ticket (honoring `signal`), emits a redacted `onPrepare` event, and returns ticket details to the caller. |
+| `prepareTicket(generateData, options?)` | `async (data, { signal?, state?, chatId?, background = true }?) => Readonly<{ ticket, proxyUrl, proxySecret, usageId, usageChatId, nativeGemini4, nativeGeminiApiVersion, tier, paygoOnly, price }>` | **Server mode only** (throws `code: 'UNSUPPORTED_MODE'` in Tauri mode). Validates state/model/region/authMode against active policy (including `MULTI_REGION_REQUIRES_FULL_AUTH` and `MULTI_REGION_SERVER_UPGRADE_REQUIRED` for `us` / `eu`), requests a single-use ticket (honoring `signal`), emits a redacted `onPrepare` event, and returns ticket details to the caller. |
 | `attachMessageUsage(options)` | `({ chatId, messageIndex, swipeId?, requests }) => boolean` | Idempotently merges one or more `{ id, model?, source?, tier?, stream?, price?, durationMs?, firstTokenMs?, interrupted? }` usage requests onto an assistant message swipe and schedules targeted `?ids=` cost reconciliation. |
 | `readUsage(chatId, options?)` | `async (chatId, { ids?, signal? }?) => { ok, records, truncated, nextCursor? }` | Read-only query against the server usage ledger (or local Tauri store in `tauri` mode). Supports targeted `{ ids }` lookup. |
 

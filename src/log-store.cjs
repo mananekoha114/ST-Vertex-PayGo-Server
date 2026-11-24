@@ -149,6 +149,9 @@ function describeError(error) {
         if (extra.authMode === 'express' || extra.authMode === 'full') {
             details.authMode = extra.authMode;
         }
+        if (typeof extra.region === 'string' && REGION_PATTERN.test(extra.region)) {
+            details.region = extra.region;
+        }
     }
     return details;
 }

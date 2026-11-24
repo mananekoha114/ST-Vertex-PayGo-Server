@@ -13,6 +13,7 @@ const path = require('node:path');
 const { pathToFileURL } = require('node:url');
 const { PluginError } = require('./errors.cjs');
 const { createVertexOAuthClient } = require('./vertex-oauth.cjs');
+const { isVertexMultiRegion, vertexApiHost } = require('./vertex-regions.cjs');
 
 const MINIMUM_SILLYTAVERN_VERSION = Object.freeze([1, 16, 0]);
 const defaultImportModule = specifier => import(specifier);
@@ -153,6 +154,14 @@ async function loadStRuntime({
                 }
                 throw new PluginError(400, 'VERTEX_AUTH_CONFIGURATION_FAILED', 'Google authentication is unavailable for this configuration.');
             }
+            if (!secretId && isVertexMultiRegion(region) && requestedAuthMode !== 'full') {
+                throw new PluginError(
+                    400,
+                    'VERTEX_MULTI_REGION_REQUIRES_FULL_AUTH',
+                    `Vertex AI multi-region "${region}" requires Full service-account authentication.`,
+                    { details: { authMode: 'express', region } },
+                );
+            }
 
             let effectiveAuthMode = requestedAuthMode;
             let credential = '';
@@ -207,7 +216,16 @@ async function loadStRuntime({
                 }
             }
 
-            const host = region === 'global' ? 'aiplatform.googleapis.com' : `${region}-aiplatform.googleapis.com`;
+            if (isVertexMultiRegion(region) && effectiveAuthMode !== 'full') {
+                throw new PluginError(
+                    400,
+                    'VERTEX_MULTI_REGION_REQUIRES_FULL_AUTH',
+                    `Vertex AI multi-region "${region}" requires Full service-account authentication.`,
+                    { details: { authMode: 'express', region } },
+                );
+            }
+
+            const host = vertexApiHost(region);
             const baseUrl = `https://${host}/v1`;
             if (effectiveAuthMode === 'express') {
                 const projectId = request.body.vertexai_express_project_id;
@@ -293,7 +311,7 @@ async function loadStRuntime({
         }
         const serialized = credentialSnapshot ?? readHostSecret(directories, secretsModule.SECRET_KEYS.VERTEXAI_SERVICE_ACCOUNT, secretId);
         if (!serialized || typeof serialized !== 'string') throw new PluginError(400, 'GOOGLE_SECRET_NOT_FOUND', 'The selected Vertex service account was not found.');
-        const host = region === 'global' ? 'aiplatform.googleapis.com' : `${region}-aiplatform.googleapis.com`;
+        const host = vertexApiHost(region);
         if (!authenticate) {
             const { projectId } = vertexOAuth.validateServiceAccount(serialized, googleModule);
             const target = `https://${host}/v1/projects/${projectId}/locations/${region}/endpoints/openapi/chat/completions`;
