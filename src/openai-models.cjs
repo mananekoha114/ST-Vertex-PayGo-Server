@@ -10,6 +10,7 @@
 
 const { PluginError } = require('./errors.cjs');
 const { BoundedBuffer } = require('./bounded-buffer.cjs');
+const { vertexApiHost } = require('./vertex-regions.cjs');
 const MODEL = /^gemini-[a-z0-9][a-z0-9._-]*$/u;
 function normalizeModel(value, source) {
     if (typeof value !== 'string') return null;
@@ -19,7 +20,7 @@ function normalizeModel(value, source) {
 }
 function validatedTarget(config, connection) {
     const target = new URL(config.target);
-    const host = connection.region === 'global' ? 'aiplatform.googleapis.com' : `${connection.region}-aiplatform.googleapis.com`;
+    const host = vertexApiHost(connection.region);
     if (target.protocol !== 'https:' || target.username || target.password || target.port || target.search || target.hash || (connection.source === 'makersuite' ? target.hostname !== 'generativelanguage.googleapis.com' || target.pathname !== '/v1beta/openai/chat/completions' : target.hostname !== host || !new RegExp(`^/v1/projects/[a-z][a-z0-9-]{4,62}/locations/${connection.region}/endpoints/openapi/chat/completions$`, 'u').test(target.pathname))) throw new PluginError(500, 'INVALID_GOOGLE_TARGET', 'The Google target is invalid.');
     return target;
 }

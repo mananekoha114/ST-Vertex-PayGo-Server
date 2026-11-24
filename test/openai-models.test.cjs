@@ -24,8 +24,16 @@ test('catalog model normalization rejects spoofed prefixes and only filters excl
 
 async function fixture(source, handler, options = {}) {
     const calls = [];
-    const connection = source === 'vertexai' ? { source, model: 'gemini-2.5-pro', authMode: 'full', region: 'us-central1' } : { source, model: 'gemini-2.5-flash' };
-    const target = source === 'vertexai' ? 'https://us-central1-aiplatform.googleapis.com/v1/projects/demo-project/locations/us-central1/endpoints/openapi/chat/completions' : 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions';
+    const region = options.region || 'us-central1';
+    const host = region === 'global'
+        ? 'aiplatform.googleapis.com'
+        : (region === 'us' || region === 'eu')
+            ? `aiplatform.${region}.rep.googleapis.com`
+            : `${region}-aiplatform.googleapis.com`;
+    const connection = source === 'vertexai' ? { source, model: 'gemini-2.5-pro', authMode: 'full', region } : { source, model: 'gemini-2.5-flash' };
+    const target = options.targetOverride || (source === 'vertexai'
+        ? `https://${host}/v1/projects/demo-project/locations/${region}/endpoints/openapi/chat/completions`
+        : 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions');
     const bridge = createOpenAIBridge({ ...options, stRuntime: { resolveOpenAIConnection: (_r, connection) => ({ connection }), async getOpenAIConfig() { return { target, headers: { Authorization: 'Bearer google-secret' } }; } }, upstreamRequest(target, requestOptions, callback) {
         const request = new PassThrough(); const chunks = [];
         request.on('data', chunk => chunks.push(chunk));
@@ -133,4 +141,52 @@ test('publisher discovery fails at its pagination limit instead of truncating', 
         assert.equal((await response.json()).error.code, 'GOOGLE_MODEL_PAGE_LIMIT');
         assert.equal(f.calls.length, 100);
     } finally { await f.close(); }
+});
+
+test('Vertex bridge discovery and completions use REP hosts for us/eu and reject non-REP multi-region hosts', async () => {
+    for (const region of ['us', 'eu']) {
+        const f = await fixture('vertexai', call => ({
+            body: call.options.method === 'GET'
+                ? { publisherModels: [{ name: 'publishers/google/models/gemini-3.8-flash' }] }
+                : call.target.pathname.includes(':generateContent')
+                    ? { candidates: [{ content: { role: 'model', parts: [{ text: 'ok' }] }, finishReason: 'STOP' }], usageMetadata: { promptTokenCount: 1, candidatesTokenCount: 1, totalTokenCount: 2 } }
+                    : { id: 'chatcmpl-1', object: 'chat.completion', choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }] },
+        }), { region });
+        try {
+            const expectedOrigin = `https://aiplatform.${region}.rep.googleapis.com`;
+            const modelsRes = await fetch(`${f.url}/models`, { headers: f.headers });
+            assert.equal(modelsRes.status, 200);
+            assert.equal(f.calls[0].target.origin, expectedOrigin);
+            assert.equal(f.calls[0].target.pathname, '/v1beta1/publishers/google/models');
+
+            const oaiRes = await fetch(`${f.url}/chat/completions`, {
+                method: 'POST',
+                headers: { ...f.headers, 'Content-Type': 'application/json' },
+                body: JSON.stringify({ model: 'st-current', messages: [{ role: 'user', content: 'hi' }] }),
+            });
+            assert.equal(oaiRes.status, 200);
+            assert.equal(f.calls[1].target.origin, expectedOrigin);
+            assert.equal(f.calls[1].target.pathname, `/v1/projects/demo-project/locations/${region}/endpoints/openapi/chat/completions`);
+
+            await f.bridge.update({ ...f.user, body: { enabled: true, mode: 'gemini' } }, f.manager);
+            const gwRes = await fetch(`${f.url}/chat/completions`, {
+                method: 'POST',
+                headers: { ...f.headers, 'Content-Type': 'application/json' },
+                body: JSON.stringify({ model: 'st-current', messages: [{ role: 'user', content: 'hi' }] }),
+            });
+            assert.equal(gwRes.status, 200);
+            assert.equal(f.calls[2].target.origin, expectedOrigin);
+            assert.equal(f.calls[2].target.pathname, `/v1/projects/demo-project/locations/${region}/publishers/google/models/gemini-2.5-pro:generateContent`);
+        } finally { await f.close(); }
+
+        const bad = await fixture('vertexai', () => ({ body: { publisherModels: [] } }), {
+            region,
+            targetOverride: `https://${region}-aiplatform.googleapis.com/v1/projects/demo-project/locations/${region}/endpoints/openapi/chat/completions`,
+        });
+        try {
+            const badRes = await fetch(`${bad.url}/models`, { headers: bad.headers });
+            assert.equal(badRes.status, 500);
+            assert.equal((await badRes.json()).error.code, 'INVALID_GOOGLE_TARGET');
+        } finally { await bad.close(); }
+    }
 });

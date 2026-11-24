@@ -11,6 +11,7 @@
 const { PluginError } = require('./errors.cjs');
 const { isGemini4Model } = require('./gemini4-models.cjs');
 const { encodedModelSegment } = require('./upstream-proxy.cjs');
+const { isVertexMultiRegion, vertexApiHost } = require('./vertex-regions.cjs');
 
 const ALLOWED_GOOGLE_HEADERS = new Set(['content-type', 'authorization', 'x-goog-api-key']);
 
@@ -19,7 +20,8 @@ function escapeRegularExpression(value) {
 }
 
 function vertexResourcePattern(region) {
-    return `(?:projects/[a-z0-9][a-z0-9-]{0,62}/locations/${escapeRegularExpression(region)}/)?`;
+    const resource = `projects/[a-z0-9][a-z0-9-]{0,62}/locations/${escapeRegularExpression(region)}/`;
+    return isVertexMultiRegion(region) ? resource : `(?:${resource})?`;
 }
 
 function parseAndValidateGoogleTarget(rawUrl, { model, region, stream, source = 'vertexai', reverseProxy }, prepared) {
@@ -43,9 +45,7 @@ function parseAndValidateGoogleTarget(rawUrl, { model, region, stream, source = 
             throw new PluginError(500, 'UNSAFE_GOOGLE_TARGET', 'The stored reverse proxy base failed validation.');
         }
     }
-    const expectedHost = aiStudio ? 'generativelanguage.googleapis.com' : region === 'global'
-        ? 'aiplatform.googleapis.com'
-        : `${region}-aiplatform.googleapis.com`;
+    const expectedHost = aiStudio ? 'generativelanguage.googleapis.com' : vertexApiHost(region);
     const endpoint = stream ? 'streamGenerateContent' : 'generateContent';
     const prefix = proxyBase ? escapeRegularExpression(proxyBase.pathname.replace(/\/+$/u, '')) : '';
     const modelSegment = escapeRegularExpression(encodedModelSegment(model));

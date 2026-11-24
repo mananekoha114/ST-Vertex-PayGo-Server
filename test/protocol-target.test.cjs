@@ -16,6 +16,7 @@ const {
     prepareGoogleTarget,
     validatePreparedGoogleTarget,
 } = require('../src/target-policy.cjs');
+const { toVertexBetaTarget } = require('../src/upstream-proxy.cjs');
 
 function validBody(overrides = {}) {
     return {
@@ -102,4 +103,41 @@ test('target header policy accepts only ST Vertex authentication headers', () =>
     });
     assert.throws(() => prepareGoogleHeaders({ Authorization: 'Bearer token', Host: 'evil.test' }, {}), { code: 'UNSAFE_GOOGLE_HEADERS' });
     assert.throws(() => prepareGoogleHeaders({ 'Content-Type': 'application/json' }, {}), { code: 'UNSAFE_GOOGLE_HEADERS' });
+});
+
+test('multi-region us and eu require REP hostnames, project/location paths, and Full auth unless proxied or deferred to secret_id', () => {
+    for (const region of ['us', 'eu']) {
+        assert.equal(validatePreparePayload(validBody({ tier: 'standard', vertexai_region: region, vertexai_auth_mode: 'full' })).region, region);
+        assert.equal(validatePreparePayload(validBody({
+            tier: 'standard', vertexai_region: region, vertexai_auth_mode: 'express', secret_id: 'profile-sa-uuid',
+        })).secretId, 'profile-sa-uuid');
+        assert.equal(validatePreparePayload(validBody({
+            tier: 'standard', vertexai_region: region, vertexai_auth_mode: 'express', reverse_proxy: 'https://proxy.example',
+        })).reverseProxy, 'https://proxy.example');
+        assert.throws(
+            () => validatePreparePayload(validBody({ tier: 'standard', vertexai_region: region, vertexai_auth_mode: 'express' })),
+            { status: 400, code: 'VERTEX_MULTI_REGION_REQUIRES_FULL_AUTH', details: { authMode: 'express', region } },
+        );
+        assert.throws(
+            () => validatePreparePayload(validBody({ tier: 'priority', vertexai_region: region, vertexai_auth_mode: 'express' })),
+            { status: 409, code: 'GLOBAL_REGION_REQUIRED' },
+        );
+
+        const repUrl = `https://aiplatform.${region}.rep.googleapis.com/v1/projects/demo-project/locations/${region}/publishers/google/models/gemini-4-hydrogen:generateContent`;
+        const config = { model: 'gemini-4-hydrogen', region, stream: false };
+        const prepared = prepareGoogleTarget(repUrl, config);
+        assert.equal(validatePreparedGoogleTarget(prepared, config).hostname, `aiplatform.${region}.rep.googleapis.com`);
+        const beta = toVertexBetaTarget(prepared, { source: 'vertexai' });
+        assert.equal(beta.href, `https://aiplatform.${region}.rep.googleapis.com/v1beta1/projects/demo-project/locations/${region}/publishers/google/models/gemini-4-hydrogen:generateContent`);
+        assert.equal(validatePreparedGoogleTarget(beta.toString(), config).hostname, `aiplatform.${region}.rep.googleapis.com`);
+
+        assert.throws(() => prepareGoogleTarget(
+            `https://${region}-aiplatform.googleapis.com/v1/projects/demo-project/locations/${region}/publishers/google/models/gemini-4-hydrogen:generateContent`,
+            config,
+        ), { code: 'UNSAFE_GOOGLE_TARGET' });
+        assert.throws(() => prepareGoogleTarget(
+            `https://aiplatform.${region}.rep.googleapis.com/v1/publishers/google/models/gemini-4-hydrogen:generateContent`,
+            config,
+        ), { code: 'UNSAFE_GOOGLE_TARGET' });
+    }
 });

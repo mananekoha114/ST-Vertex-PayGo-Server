@@ -19,6 +19,7 @@ const { createPrepareHandler } = require('./prepare-route.cjs');
 const { createUsageHandler } = require('./usage-route.cjs');
 const { registerDataBackupRoutes } = require('./data-backup-routes.cjs');
 const { createNativeGeminiHandler } = require('./native-gemini.cjs');
+const { VERTEX_MULTI_REGIONS } = require('./vertex-regions.cjs');
 const {
     createCheckUpdateHandler,
     createStartUpdateHandler,
@@ -45,6 +46,7 @@ function registerRoutes(router, dependencies) {
                 clientLogging: isAdmin,
                 usage: true,
                 nativeGemini4: Boolean(dependencies.loopbackTransport),
+                vertexMultiRegions: [...VERTEX_MULTI_REGIONS],
                 dataBackups: Boolean(dependencies.dataBackups),
                 // Absent means the backend predates the panel updater; false
                 // means the caller is not an administrator.

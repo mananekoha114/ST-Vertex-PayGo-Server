@@ -10,6 +10,7 @@
 
 const { PluginError } = require('./errors.cjs');
 const { isProxyModel, validateReverseProxy } = require('./upstream-proxy.cjs');
+const { isVertexMultiRegion } = require('./vertex-regions.cjs');
 
 const PROTOCOL_VERSION = 3;
 const PLUGIN_ID = 'vertex-paygo';
@@ -161,6 +162,14 @@ function validatePreparePayload(body) {
     let secretId;
     if (body.secret_id !== undefined && body.secret_id !== null && body.secret_id !== '') {
         secretId = requireCanonicalString(body.secret_id, 'secret ID', /^[A-Za-z0-9_-]+$/u, 128);
+    }
+    if (source === 'vertexai' && !upstreamProxy && !secretId && isVertexMultiRegion(region) && authMode !== 'full') {
+        throw new PluginError(
+            400,
+            'VERTEX_MULTI_REGION_REQUIRES_FULL_AUTH',
+            `Vertex AI multi-region "${region}" requires Full service-account authentication.`,
+            { details: { authMode: 'express', region } },
+        );
     }
 
     const usageChatId = body.usageChatId === undefined || body.usageChatId === null || body.usageChatId === ''

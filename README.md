@@ -18,7 +18,7 @@
 桥接对外提供 Chat Completions 请求，默认转发到以下 Google 官方 OpenAI 兼容端点：
 
 - AI Studio：`https://generativelanguage.googleapis.com/v1beta/openai/chat/completions`，使用宿主保存的 Gemini API key。
-- Vertex AI：`https://{region}-aiplatform.googleapis.com/v1/projects/{project}/locations/{region}/endpoints/openapi/chat/completions`；`global` 使用 `aiplatform.googleapis.com`，由宿主保存的服务账号换取 OAuth access token。
+- Vertex AI：`https://{region}-aiplatform.googleapis.com/v1/projects/{project}/locations/{region}/endpoints/openapi/chat/completions`；`global` 使用 `aiplatform.googleapis.com`，`us` / `eu` 多地区使用 `aiplatform.{us|eu}.rep.googleapis.com`，由宿主保存的服务账号换取 OAuth access token。
 
 Vertex 可选择 `mode: "gemini"` 网关，将 OpenAI 请求转换为同一绑定项目、区域和凭据下的原生 `generateContent` / `streamGenerateContent`，再将 Google JSON/SSE 转为 OpenAI JSON/SSE。AI Studio 保持原生 OpenAI 兼容转发，不提供网关或桥接层级策略。Vertex Express/API key 认证暂不支持。桥接不跟随 HTTP 重定向，不自动重试、换账号或失败回退其他协议。官方端点的使用不构成账号安全、免封或合规保证。
 
@@ -82,7 +82,7 @@ Vertex Flex 仅在 Gemini 网关模式可用，原生 OpenAI 模式拒绝 Flex�
 `GET /openai/v1/models` 每次查询绑定提供商的官方模型目录，并返回 OpenAI 格式的 `data` 数组，包含 `st-current`、绑定模型及发现的 Gemini 模型。不使用 PayGo 支持名单限制选模，也不发送生成请求探测模型。
 
 - AI Studio：`GET https://generativelanguage.googleapis.com/v1beta/openai/models`，使用绑定 key 的 Bearer 认证。
-- Vertex Full：`GET https://{regional-host}/v1beta1/publishers/google/models?view=PUBLISHER_MODEL_VIEW_FULL&listAllVersions=true&pageSize=100`，使用绑定服务账号的 OAuth；`global` 使用 `aiplatform.googleapis.com`，其他区域使用 `{region}-aiplatform.googleapis.com`。跟随 `nextPageToken` 遍历分页，不跟随任意上游 URL。
+- Vertex Full：`GET https://{regional-host}/v1beta1/publishers/google/models?view=PUBLISHER_MODEL_VIEW_FULL&listAllVersions=true&pageSize=100`，使用绑定服务账号的 OAuth；`global` 使用 `aiplatform.googleapis.com`，`us` / `eu` 多地区使用 `aiplatform.{us|eu}.rep.googleapis.com`，其余单区域使用 `{region}-aiplatform.googleapis.com`。跟随 `nextPageToken` 遍历分页，不跟随任意上游 URL。
 - 仅返回合法 Gemini 模型名称，过滤 embedding、Live、原生音频、TTS 专用名称并去重；不把目录内部 `versionId` 拼成调用 ID。Vertex 返回 `google/gemini-*`，AI Studio 返回 `gemini-*`。
 - 目录不代表项目、区域或生成接口的调用权限保证。调用端可直接在 `model` 指定具体名称，实际支持由 Google 校验；生成接口按桥接选择的模式固定。
 - 查询错误直接返回，不用静态列表掩盖失败。目录查询也受鉴权、取消、并发与总超时限制；最多读取 100 页、累计 8 MiB，超过限制明确报错，不返回截断名单。
@@ -183,7 +183,8 @@ SillyTavern 与 Luker 原生请求管道并未对外暴露 Google 专有的 PayG
 | **Priority** | `X-Vertex-AI-LLM-Shared-Request-Type: priority` |
 
 - `PayGo-only` 可与 `Flex` 或 `Priority` 自由叠加（同时注入两组标头）；
-- **Standard 且未勾选 PayGo-only** 也通过插件代理，以便捕获用量；插件不为它追加任何层级标头或请求体字段。
+- **Standard 且未勾选 PayGo-only** 也通过插件代理，以便捕获用量；插件不为它追加任何层级标头或请求体字段；
+- **区域与多地区端点路由**：官方直连时，`global` 发往 `aiplatform.googleapis.com`，单区域（如 `us-central1`）发往 `{region}-aiplatform.googleapis.com`，`us` / `eu` 多地区数据驻留端点发往 `aiplatform.{us|eu}.rep.googleapis.com`（路径均保留 `/projects/{project}/locations/{region}/...`，Gemini 4 在转发阶段改写为 `v1beta1`）。`us` / `eu` 仅允许 **Full（服务账号 JSON）** 认证（携带显式 `secret_id` 时先按宿主密钥库推断真实凭据类型），Express API Key 模式在 `us` / `eu` 下以 `400 VERTEX_MULTI_REGION_REQUIRES_FULL_AUTH` 明确拦截。
 
 ### 2. Google AI Studio (Standard / Flex)
 Google AI Studio 的 Standard 与 Flex 模式复用相同的预检机制、鉴权助手、内存票据池与本地 HTTP 转发管道，端点直接面向 `generativelanguage.googleapis.com`：
@@ -307,7 +308,7 @@ Gemini 4（`gemini-4-neon`、`gemini-4-hydrogen`、`gemini-4-carbon`、`gemini-4
 面向第三方扩展与运维部署的完整协议规范见 [docs/protocol-and-extensions.md](docs/protocol-and-extensions.md)，涵盖：
 
 - 运行时目录环境变量（`ST_VERTEX_PAYGO_DATA_DIR`、`ST_VERTEX_PAYGO_LOG_DIR`、`<dataRoot>/vertex-paygo`）、旧配置迁移与只读降级；
-- `protocolVersion: 3` 契约：`/prepare`（含 AI Studio `base_url` 与取消释放语义）及 `GET /usage`（分页与 `?ids=` 批量直查）；
+- `protocolVersion: 3` 契约：`/prepare`（含 AI Studio `base_url`、Vertex `us`/`eu` 多地区 REP 路由与 `vertexMultiRegions` 能力声明、取消释放语义）及 `GET /usage`（分页与 `?ids=` 批量直查）；
 - Native Gemini 4 签名信封（`st-vertex-paygo-tool:v1:`、`st-vertex-paygo-text:v1:`）与跨路由行为说明；
 - 流式请求响应头发送前（非 2xx JSON）与发送后（SSE `data: {"error": ...}`）的错误边界约定；
 - 前端 `window.STVertexPayGo`（`apiVersion: 1`）公开协作接口及多轮工具接力接入示例。
